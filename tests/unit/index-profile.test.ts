@@ -201,6 +201,7 @@ describe("pending profile differences", () => {
       },
       extensionLanguageMap: { ".inc": ".php" },
       maxFileBytes: 5_000_000,
+      bm25Text: "raw",
     });
     const requested = profile({
       queryPrefix: "new-query: ",
@@ -216,6 +217,7 @@ describe("pending profile differences", () => {
       },
       extensionLanguageMap: { ".module": ".php" },
       maxFileBytes: 1_000_000,
+      bm25Text: "lexical",
     });
 
     expect(indexProfileDifferences(effective, requested)).toEqual([
@@ -231,6 +233,7 @@ describe("pending profile differences", () => {
       "LITELLM_SEND_DIMENSIONS",
       "EXTENSION_LANGUAGE_MAP",
       "MAX_FILE_SIZE_MB",
+      "BM25_TEXT",
     ]);
   });
 });

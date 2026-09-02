@@ -19,6 +19,7 @@ import {
 } from "./embedding-config.js";
 import { getEmbeddingProvider } from "./embedding-provider.js";
 import type { EmbeddingReadinessResult } from "./embedding-types.js";
+import { type Bm25TextMode, bm25TextMode } from "./lexical.js";
 
 export const INDEX_PROFILE_SCHEMA_VERSION = 1;
 export const CURRENT_INDEX_FORMAT_VERSION = 1;
@@ -52,6 +53,8 @@ export interface EffectiveIndexProfile {
   extensionLanguageMap?: Record<string, string>;
   /** Maximum source-file bytes. Code profiles only. */
   maxFileBytes?: number;
+  /** What the BM25 sparse vector is built from. Code profiles only; `raw` when absent. */
+  bm25Text?: Bm25TextMode;
   /** Values adopted from current runtime because legacy metadata did not store them. */
   legacyUnverifiedFields: string[];
 }
@@ -105,6 +108,7 @@ export function requestedIndexProfile(kind: IndexProfileKind): EffectiveIndexPro
       ? {
           extensionLanguageMap: extensionLanguageMapRecord(),
           maxFileBytes: MAX_FILE_BYTES,
+          bm25Text: bm25TextMode(),
         }
       : {}),
     legacyUnverifiedFields: [],
@@ -127,6 +131,8 @@ export function legacyIndexProfile(
     documentPrefix: LEGACY_DOCUMENT_PREFIX,
     documentIncludesPath: true,
     maxChunkChars: LEGACY_MAX_CHUNK_CHARS,
+    // A collection that predates this field was built from the document text.
+    ...(kind === "code" ? { bm25Text: "raw" as const } : {}),
     embedding: {
       ...requested.embedding,
       ...(dimensionsAreVerified
@@ -292,6 +298,7 @@ export function indexProfileDifferences(
       requested.extensionLanguageMap,
     );
     compare("MAX_FILE_SIZE_MB", effective.maxFileBytes, requested.maxFileBytes);
+    compare("BM25_TEXT", effective.bm25Text ?? "raw", requested.bm25Text ?? "raw");
   }
   return differences;
 }
@@ -380,7 +387,15 @@ export function parseEffectiveIndexProfile(
 
   let extensionLanguageMap: Record<string, string> | undefined;
   let maxFileBytes: number | undefined;
+  let bm25Text: Bm25TextMode | undefined;
   if (raw.kind === "code") {
+    // Absent means the profile was persisted before the field existed; readers treat that as raw.
+    if (raw.bm25Text !== undefined) {
+      if (raw.bm25Text !== "raw" && raw.bm25Text !== "lexical") {
+        throw new Error('Effective index profile bm25Text must be "raw" or "lexical".');
+      }
+      bm25Text = raw.bm25Text;
+    }
     const extensionMapRaw = assertRecord(
       raw.extensionLanguageMap,
       "Effective extension language map",
@@ -418,6 +433,7 @@ export function parseEffectiveIndexProfile(
       litellmSendDimensions: embedding.litellmSendDimensions,
     },
     ...(raw.kind === "code" ? { extensionLanguageMap, maxFileBytes } : {}),
+    ...(bm25Text !== undefined ? { bm25Text } : {}),
     legacyUnverifiedFields: [...legacyUnverifiedFields] as string[],
   };
 }

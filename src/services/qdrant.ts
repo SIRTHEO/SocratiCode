@@ -15,7 +15,7 @@ import {
   resolveEffectiveIndexProfile,
   withEffectiveEmbedding,
 } from "./index-profile.js";
-import { expandQuery, lexicalProjection } from "./lexical.js";
+import { bm25TextFor, expandQuery } from "./lexical.js";
 import { logger } from "./logger.js";
 
 const MAX_RETRIES = 3;
@@ -300,7 +300,7 @@ export async function upsertChunks(
     vector: {
       dense: embeddings[i],
       bm25: {
-        text: lexicalProjection(chunk.content, chunk.relativePath, chunk.language),
+        text: bm25TextFor(chunk, texts[i], profile),
         model: "qdrant/bm25",
       },
     },
@@ -426,7 +426,7 @@ export async function searchChunks(
 ): Promise<SearchResult[]> {
   const profile = await loadEffectiveIndexProfileForCollection(collectionName);
   const queryVector = await queryVectorForProfile(query, profile);
-  return searchChunksWithVector(collectionName, query, queryVector, limit, fileFilter, languageFilter);
+  return searchChunksWithVector(collectionName, bm25QueryFor(query, profile), queryVector, limit, fileFilter, languageFilter);
 }
 
 function collectionProfileKind(collectionName: string): "code" | "context" {
@@ -468,6 +468,11 @@ function queryVectorForProfile(
 
 /** Internal: hybrid search using a pre-computed dense embedding vector.
  * Avoids recomputing the same embedding when querying multiple collections. */
+/** The BM25 query text a collection expects: expanded only where the index was built `lexical`. */
+function bm25QueryFor(query: string, profile: EffectiveIndexProfile): string {
+  return profile.bm25Text === "lexical" ? expandQuery(query) : query;
+}
+
 async function searchChunksWithVector(
   collectionName: string,
   query: string,
@@ -502,7 +507,7 @@ async function searchChunksWithVector(
     prefetch: [
       { query: queryVector, using: "dense", limit: prefetchLimit, filter: activeFilter },
       {
-        query: { text: expandQuery(query), model: "qdrant/bm25" },
+        query: { text: query, model: "qdrant/bm25" },
         using: "bm25",
         limit: prefetchLimit,
         filter: activeFilter,
@@ -711,7 +716,7 @@ export async function searchMultipleCollections(
         // includeDenseScore: results from different collections are about to be
         // ordered against each other, which their per-collection RRF scores
         // cannot support.
-        const results = await searchChunksWithVector(name, query, queryVector, perCollectionLimit, fileFilter, languageFilter, true);
+        const results = await searchChunksWithVector(name, bm25QueryFor(query, profile), queryVector, perCollectionLimit, fileFilter, languageFilter, true);
         return { label, results };
       } catch (err) {
         logger.warn("searchMultipleCollections: collection query failed, skipping", {
@@ -751,7 +756,7 @@ export async function searchChunksWithFilter(
       prefetch: [
         { query: queryVector, using: "dense", limit: prefetchLimit, filter },
         {
-          query: { text: expandQuery(query), model: "qdrant/bm25" },
+          query: { text: bm25QueryFor(query, profile), model: "qdrant/bm25" },
           using: "bm25",
           limit: prefetchLimit,
           filter,

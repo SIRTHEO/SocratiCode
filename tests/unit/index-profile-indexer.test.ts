@@ -26,7 +26,6 @@ const observedEmbeddingConfigs: Array<{
   dimensions: number;
 }> = [];
 const observedCollectionDimensions: number[] = [];
-const embeddedTexts: string[] = [];
 
 vi.mock("../../src/services/logger.js", () => ({
   logger: {
@@ -54,7 +53,6 @@ vi.mock("../../src/services/embeddings.js", () => ({
     profile: { documentPrefix: string; documentIncludesPath: boolean },
   ) => `${profile.documentPrefix}${profile.documentIncludesPath ? `${filePath}\n` : ""}${content}`),
   generateEmbeddings: vi.fn(async (texts: string[]) => {
-    embeddedTexts.push(...texts);
     const { getEmbeddingConfig } = await import("../../src/services/embedding-config.js");
     const config = getEmbeddingConfig();
     observedEmbeddingConfigs.push({
@@ -167,7 +165,6 @@ beforeEach(async () => {
   savedMetadata.length = 0;
   deletedFiles.length = 0;
   upsertedBatches.length = 0;
-  embeddedTexts.length = 0;
   observedEmbeddingConfigs.length = 0;
   observedCollectionDimensions.length = 0;
   tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "socraticode-profile-indexer-"));
@@ -199,7 +196,57 @@ describe("code-index effective profile compatibility", () => {
       documentPrefix: "search_document: ",
       documentIncludesPath: true,
       maxChunkChars: 2000,
+      bm25Text: "raw",
     });
+  });
+
+  it("builds a fresh index with the lexical BM25 text and persists that mode", async () => {
+    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000", EMBEDDING_DOCUMENT_INCLUDE_PATH: "true" });
+    const content = "export function sendOperatorMessage(waId: string) { return waId; }";
+    const project = await createProject("routes.ts", content);
+    collectionInfo = null;
+    storedProfile = null;
+
+    await indexer.indexProject(project);
+
+    expect(savedMetadata.at(-1)?.profile).toMatchObject({ source: "fresh", bm25Text: "lexical" });
+    const points = upsertedBatches.flat();
+    expect(points).toHaveLength(1);
+    const bm25Text = String(points[0].bm25Text);
+    expect(bm25Text.startsWith("routes.ts\nroutes ts\n")).toBe(true);
+    expect(bm25Text.endsWith("\nsend Operator Message wa Id")).toBe(true);
+    expect(bm25Text).not.toContain("requested-document:");
+  });
+
+  it("keeps the path out of the lexical BM25 text when the profile does not embed it", async () => {
+    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000" });
+    const project = await createProject("routes.ts", "export function sendOperatorMessage() {}");
+    collectionInfo = null;
+    storedProfile = null;
+
+    await indexer.indexProject(project);
+
+    const bm25Text = String(upsertedBatches.flat()[0].bm25Text);
+    expect(bm25Text).not.toContain("routes");
+    expect(bm25Text).toContain("sendOperatorMessage");
+    expect(bm25Text.endsWith("\nsend Operator Message")).toBe(true);
+  });
+
+  it("keeps a raw collection raw through an incremental update", async () => {
+    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000" });
+    const { requestedIndexProfile } = await import("../../src/services/index-profile.js");
+    const content = "/** Nota. */\nexport function sendOperatorMessage() {}";
+    const project = await createProject("routes.ts", content);
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedProfile = { ...requestedIndexProfile("code"), bm25Text: "raw" };
+    storedHashes = new Map([["routes.ts", indexer.hashContent("old source")]]);
+
+    await indexer.updateProjectIndex(project);
+
+    const points = upsertedBatches.flat();
+    expect(points).toHaveLength(1);
+    expect(points[0].bm25Text).toBe(`requested-document: ${content}`);
+    expect(savedMetadata.at(-1)?.profile.bm25Text).toBe("raw");
   });
 
   it("replaces a changed legacy file with the legacy document representation", async () => {
@@ -215,8 +262,7 @@ describe("code-index effective profile compatibility", () => {
     expect(deletedFiles).toEqual(["notes.txt"]);
     const points = upsertedBatches.flat();
     expect(points).toHaveLength(1);
-    expect(embeddedTexts).toEqual([`search_document: notes.txt\n${content}`]);
-    expect(String(points[0].bm25Text)).toContain(content);
+    expect(points[0].bm25Text).toBe(`search_document: notes.txt\n${content}`);
     expect((points[0].payload as { content: string }).content.length).toBeGreaterThan(20);
     expect(savedMetadata.at(-1)?.profile.source).toBe("legacy-adopted");
   });
@@ -291,14 +337,13 @@ describe("code-index effective profile compatibility", () => {
     expect(points.every((point) =>
       (point.payload as { content: string }).content.length > 20
     )).toBe(true);
-    expect(embeddedTexts.length).toBe(points.length);
-    expect(embeddedTexts.every((text) =>
-      text.startsWith("search_document: notes.txt\n")
+    expect(points.every((point) =>
+      String(point.bm25Text).startsWith("search_document: notes.txt\n")
     )).toBe(true);
   });
 
   it("activates the requested profile after collection removal even if stale metadata remains", async () => {
-    const indexer = await loadIndexer();
+    const indexer = await loadIndexer({ BM25_TEXT: "raw" });
     const { legacyIndexProfile } = await import("../../src/services/index-profile.js");
     const project = await createProject(
       "notes.txt",
@@ -317,14 +362,14 @@ describe("code-index effective profile compatibility", () => {
       documentPrefix: "requested-document: ",
       documentIncludesPath: false,
       maxChunkChars: 20,
+      bm25Text: "raw",
     });
     expect(savedMetadata.at(-1)?.hashes.has("stale.txt")).toBe(false);
     const points = upsertedBatches.flat();
     expect(points.length).toBeGreaterThan(0);
-    expect(embeddedTexts.length).toBe(points.length);
-    expect(embeddedTexts.every((text) =>
-      text.startsWith("requested-document: ") &&
-      !text.includes("notes.txt\n")
+    expect(points.every((point) =>
+      String(point.bm25Text).startsWith("requested-document: ") &&
+      !String(point.bm25Text).includes("notes.txt\n")
     )).toBe(true);
   });
 

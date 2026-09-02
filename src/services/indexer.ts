@@ -34,7 +34,7 @@ import {
   resolveEffectiveIndexProfile,
   withEffectiveEmbedding,
 } from "./index-profile.js";
-import { lexicalProjection } from "./lexical.js";
+import { bm25TextFor } from "./lexical.js";
 import { acquireProjectLock, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
 import {
@@ -315,13 +315,63 @@ interface AstRegion {
  * Use ast-grep to find top-level declaration boundaries in source code.
  * Returns sorted, non-overlapping regions.
  */
-function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
+type AstRoot = ReturnType<ReturnType<typeof parse>["root"]>;
+
+function parseRoot(source: string, lang: Lang | string): AstRoot | null {
+  try {
+    return parse(lang, source).root();
+  } catch {
+    return null;
+  }
+}
+
+/** Character spans of every comment node in the tree, in document order. */
+function commentSpans(root: AstRoot): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  const walk = (node: AstRoot): void => {
+    if (String(node.kind()).includes("comment")) {
+      const range = node.range();
+      spans.push([range.start.index, range.end.index]);
+      return;
+    }
+    for (const child of node.children()) walk(child);
+  };
+  walk(root);
+  return spans;
+}
+
+/** Fill `chunk.code`: the chunk's content with the parser's comment spans cut out. */
+function withCommentFreeCode(
+  chunks: FileChunk[],
+  content: string,
+  spans: Array<[number, number]>,
+): FileChunk[] {
+  if (spans.length === 0) return chunks.map((c) => ({ ...c, code: c.content }));
+  const lineStart: number[] = [0];
+  for (let i = 0; i < content.length; i++) if (content[i] === "\n") lineStart.push(i + 1);
+  return chunks.map((c) => {
+    const from = lineStart[c.startLine - 1] ?? 0;
+    const to = from + c.content.length;
+    let code = "";
+    let cursor = from;
+    for (const [a, b] of spans) {
+      if (b <= from) continue;
+      if (a >= to) break;
+      code += content.slice(cursor, Math.max(cursor, a)) + " ";
+      cursor = Math.min(to, b);
+    }
+    code += content.slice(cursor, to);
+    return { ...c, code };
+  });
+}
+
+function findAstBoundaries(source: string, lang: Lang | string, parsed?: AstRoot | null): AstRegion[] {
   const langKey = String(lang);
   const kinds = TOP_LEVEL_KINDS[langKey];
   if (!kinds) return [];
 
   try {
-    const root = parse(lang, source).root();
+    const root = parsed ?? parse(lang, source).root();
     const regions: AstRegion[] = [];
 
     for (const kind of kinds) {
@@ -507,9 +557,17 @@ export function chunkFileContent(
     );
   }
 
+  // One parse serves both the declaration boundaries and the comment spans.
+  const astLang = isElixirTemplateExtension(ext) ? null : getAstGrepLang(ext, extensionLanguageMap);
+  const root = astLang ? parseRoot(content, astLang) : null;
+  const finish = (chunks: FileChunk[]): FileChunk[] => {
+    const capped = applyCharCap(chunks, maxChunkChars);
+    return root ? withCommentFreeCode(capped, content, commentSpans(root)) : capped;
+  };
+
   // Small files: single chunk regardless of language
   if (lines.length <= CHUNK_SIZE) {
-    return applyCharCap([{
+    return finish([{
       id: chunkId(relativePath, 1),
       filePath,
       relativePath,
@@ -518,27 +576,20 @@ export function chunkFileContent(
       endLine: lines.length,
       language,
       type: "code",
-    }], maxChunkChars);
+    }]);
   }
 
   // Try AST-aware chunking for supported languages and mixed Elixir templates.
-  const astLang = getAstGrepLang(ext, extensionLanguageMap);
   const regions = isElixirTemplateExtension(ext)
     ? (analyzeElixirTemplate(content, ext)?.regions ?? [])
-    : astLang ? findAstBoundaries(content, astLang) : [];
+    : astLang && root ? findAstBoundaries(content, astLang, root) : [];
 
   if (regions.length > 0) {
-    return applyCharCap(
-      chunkByAstRegions(filePath, relativePath, lines, language, regions),
-      maxChunkChars,
-    );
+    return finish(chunkByAstRegions(filePath, relativePath, lines, language, regions));
   }
 
   // Fallback: line-based chunking
-  return applyCharCap(
-    chunkByLines(filePath, relativePath, lines, language),
-    maxChunkChars,
-  );
+  return finish(chunkByLines(filePath, relativePath, lines, language));
 }
 
 /**
@@ -1009,7 +1060,7 @@ export async function indexProject(
     const batchPoints = batchChunkData.map((c, i) => ({
       id: c.chunk.id,
       vector: batchEmbeddings[i],
-      bm25Text: lexicalProjection(c.chunk.content, c.chunk.relativePath, c.chunk.language),
+      bm25Text: bm25TextFor(c.chunk, batchTexts[i], effectiveProfile),
       payload: {
         filePath: c.chunk.filePath,
         relativePath: c.chunk.relativePath,
@@ -1385,7 +1436,7 @@ export async function updateProjectIndex(
       const batchPoints = batchChunkData.map((c, i) => ({
         id: c.chunk.id,
         vector: batchEmbeddings[i],
-        bm25Text: lexicalProjection(c.chunk.content, c.chunk.relativePath, c.chunk.language),
+        bm25Text: bm25TextFor(c.chunk, batchTexts[i], effectiveProfile),
         payload: {
           filePath: c.chunk.filePath,
           relativePath: c.chunk.relativePath,
