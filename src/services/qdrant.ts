@@ -15,6 +15,7 @@ import {
   resolveEffectiveIndexProfile,
   withEffectiveEmbedding,
 } from "./index-profile.js";
+import { expandQuery, lexicalProjection } from "./lexical.js";
 import { logger } from "./logger.js";
 
 const MAX_RETRIES = 3;
@@ -299,7 +300,7 @@ export async function upsertChunks(
     vector: {
       dense: embeddings[i],
       bm25: {
-        text: texts[i],
+        text: lexicalProjection(chunk.content, chunk.relativePath, chunk.language),
         model: "qdrant/bm25",
       },
     },
@@ -501,7 +502,7 @@ async function searchChunksWithVector(
     prefetch: [
       { query: queryVector, using: "dense", limit: prefetchLimit, filter: activeFilter },
       {
-        query: { text: query, model: "qdrant/bm25" },
+        query: { text: expandQuery(query), model: "qdrant/bm25" },
         using: "bm25",
         limit: prefetchLimit,
         filter: activeFilter,
@@ -750,7 +751,7 @@ export async function searchChunksWithFilter(
       prefetch: [
         { query: queryVector, using: "dense", limit: prefetchLimit, filter },
         {
-          query: { text: query, model: "qdrant/bm25" },
+          query: { text: expandQuery(query), model: "qdrant/bm25" },
           using: "bm25",
           limit: prefetchLimit,
           filter,

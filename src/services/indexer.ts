@@ -34,6 +34,7 @@ import {
   resolveEffectiveIndexProfile,
   withEffectiveEmbedding,
 } from "./index-profile.js";
+import { lexicalProjection } from "./lexical.js";
 import { acquireProjectLock, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
 import {
@@ -1008,7 +1009,7 @@ export async function indexProject(
     const batchPoints = batchChunkData.map((c, i) => ({
       id: c.chunk.id,
       vector: batchEmbeddings[i],
-      bm25Text: batchTexts[i],
+      bm25Text: lexicalProjection(c.chunk.content, c.chunk.relativePath, c.chunk.language),
       payload: {
         filePath: c.chunk.filePath,
         relativePath: c.chunk.relativePath,
@@ -1384,7 +1385,7 @@ export async function updateProjectIndex(
       const batchPoints = batchChunkData.map((c, i) => ({
         id: c.chunk.id,
         vector: batchEmbeddings[i],
-        bm25Text: batchTexts[i],
+        bm25Text: lexicalProjection(c.chunk.content, c.chunk.relativePath, c.chunk.language),
         payload: {
           filePath: c.chunk.filePath,
           relativePath: c.chunk.relativePath,

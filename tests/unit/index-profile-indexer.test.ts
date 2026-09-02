@@ -26,6 +26,7 @@ const observedEmbeddingConfigs: Array<{
   dimensions: number;
 }> = [];
 const observedCollectionDimensions: number[] = [];
+const embeddedTexts: string[] = [];
 
 vi.mock("../../src/services/logger.js", () => ({
   logger: {
@@ -53,6 +54,7 @@ vi.mock("../../src/services/embeddings.js", () => ({
     profile: { documentPrefix: string; documentIncludesPath: boolean },
   ) => `${profile.documentPrefix}${profile.documentIncludesPath ? `${filePath}\n` : ""}${content}`),
   generateEmbeddings: vi.fn(async (texts: string[]) => {
+    embeddedTexts.push(...texts);
     const { getEmbeddingConfig } = await import("../../src/services/embedding-config.js");
     const config = getEmbeddingConfig();
     observedEmbeddingConfigs.push({
@@ -165,6 +167,7 @@ beforeEach(async () => {
   savedMetadata.length = 0;
   deletedFiles.length = 0;
   upsertedBatches.length = 0;
+  embeddedTexts.length = 0;
   observedEmbeddingConfigs.length = 0;
   observedCollectionDimensions.length = 0;
   tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "socraticode-profile-indexer-"));
@@ -212,7 +215,8 @@ describe("code-index effective profile compatibility", () => {
     expect(deletedFiles).toEqual(["notes.txt"]);
     const points = upsertedBatches.flat();
     expect(points).toHaveLength(1);
-    expect(points[0].bm25Text).toBe(`search_document: notes.txt\n${content}`);
+    expect(embeddedTexts).toEqual([`search_document: notes.txt\n${content}`]);
+    expect(String(points[0].bm25Text)).toContain(content);
     expect((points[0].payload as { content: string }).content.length).toBeGreaterThan(20);
     expect(savedMetadata.at(-1)?.profile.source).toBe("legacy-adopted");
   });
@@ -287,8 +291,9 @@ describe("code-index effective profile compatibility", () => {
     expect(points.every((point) =>
       (point.payload as { content: string }).content.length > 20
     )).toBe(true);
-    expect(points.every((point) =>
-      String(point.bm25Text).startsWith("search_document: notes.txt\n")
+    expect(embeddedTexts.length).toBe(points.length);
+    expect(embeddedTexts.every((text) =>
+      text.startsWith("search_document: notes.txt\n")
     )).toBe(true);
   });
 
@@ -316,9 +321,10 @@ describe("code-index effective profile compatibility", () => {
     expect(savedMetadata.at(-1)?.hashes.has("stale.txt")).toBe(false);
     const points = upsertedBatches.flat();
     expect(points.length).toBeGreaterThan(0);
-    expect(points.every((point) =>
-      String(point.bm25Text).startsWith("requested-document: ") &&
-      !String(point.bm25Text).includes("notes.txt\n")
+    expect(embeddedTexts.length).toBe(points.length);
+    expect(embeddedTexts.every((text) =>
+      text.startsWith("requested-document: ") &&
+      !text.includes("notes.txt\n")
     )).toBe(true);
   });
 
