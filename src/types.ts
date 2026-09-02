@@ -9,8 +9,6 @@ export interface FileChunk {
   endLine: number;
   language: string;
   type: "code" | "comment" | "mixed";
-  /** Content with comments removed by the parser; absent when no grammar parsed the file. */
-  code?: string;
 }
 
 export interface CodeGraphNode {

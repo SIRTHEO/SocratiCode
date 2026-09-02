@@ -241,7 +241,7 @@ All constants are defined in `src/constants.ts`:
 | `MAX_FILE_BYTES` | `5 MB` | Max file size before skipping (env-configurable via `MAX_FILE_SIZE_MB`) |
 | `MAX_AVG_LINE_LENGTH` | `500` | Avg line length above which character-based chunking is used (minified files) |
 | `MAX_CHUNK_CHARS` | `2000` | Hard character limit per chunk (provider-level safety net, env-configurable via `MAX_CHUNK_CHARS`) |
-| `BM25_TEXT` | `lexical` | What the BM25 leg indexes for code collections: `lexical` (comment-free code + identifier words) or `raw` (the embedded document text). Part of the effective index profile |
+| `BM25_TEXT` | `lexical` | What the BM25 leg indexes for code collections: `lexical` (the embedded document text plus identifier words) or `raw` (the embedded document text alone). Part of the effective index profile |
 | `QDRANT_PORT` | `16333` | Qdrant HTTP API port (host-side) |
 | `QDRANT_GRPC_PORT` | `16334` | Qdrant gRPC port (host-side) |
 | `QDRANT_CONTAINER_NAME` | `socraticode-qdrant` | Docker container name |
@@ -382,7 +382,7 @@ When `codebase_index` is called:
    For each batch of files:
    ├── Prepare text: "{documentPrefix}{relativePath}\n{content}" (prefix defaults to "search_document: ", see EMBEDDING_DOCUMENT_PREFIX; the path is dropped when EMBEDDING_DOCUMENT_INCLUDE_PATH=false)
    ├── Generate embeddings via configured provider (further batched internally)
-   ├── BM25 text per the collection's profile (BM25_TEXT): "lexical" = path + comment-free code (from the parse tree, `FileChunk.code`) + split identifier words; "raw" = the prepared text above
+   ├── BM25 text per the collection's profile (BM25_TEXT): "lexical" = the prepared text above + the words of every multi-word identifier; "raw" = the prepared text above
    ├── Upsert to Qdrant with dense vector + BM25 text + payload
    ├── Update in-memory file hashes
    ├── Checkpoint: persist hashes to Qdrant (progress survives crashes)

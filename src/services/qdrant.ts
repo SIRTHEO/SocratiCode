@@ -300,7 +300,7 @@ export async function upsertChunks(
     vector: {
       dense: embeddings[i],
       bm25: {
-        text: bm25TextFor(chunk, texts[i], profile),
+        text: bm25TextFor(texts[i], profile),
         model: "qdrant/bm25",
       },
     },

@@ -201,7 +201,7 @@ describe("code-index effective profile compatibility", () => {
   });
 
   it("builds a fresh index with the lexical BM25 text and persists that mode", async () => {
-    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000", EMBEDDING_DOCUMENT_INCLUDE_PATH: "true" });
+    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000" });
     const content = "export function sendOperatorMessage(waId: string) { return waId; }";
     const project = await createProject("routes.ts", content);
     collectionInfo = null;
@@ -212,24 +212,7 @@ describe("code-index effective profile compatibility", () => {
     expect(savedMetadata.at(-1)?.profile).toMatchObject({ source: "fresh", bm25Text: "lexical" });
     const points = upsertedBatches.flat();
     expect(points).toHaveLength(1);
-    const bm25Text = String(points[0].bm25Text);
-    expect(bm25Text.startsWith("routes.ts\nroutes ts\n")).toBe(true);
-    expect(bm25Text.endsWith("\nsend Operator Message wa Id")).toBe(true);
-    expect(bm25Text).not.toContain("requested-document:");
-  });
-
-  it("keeps the path out of the lexical BM25 text when the profile does not embed it", async () => {
-    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000" });
-    const project = await createProject("routes.ts", "export function sendOperatorMessage() {}");
-    collectionInfo = null;
-    storedProfile = null;
-
-    await indexer.indexProject(project);
-
-    const bm25Text = String(upsertedBatches.flat()[0].bm25Text);
-    expect(bm25Text).not.toContain("routes");
-    expect(bm25Text).toContain("sendOperatorMessage");
-    expect(bm25Text.endsWith("\nsend Operator Message")).toBe(true);
+    expect(points[0].bm25Text).toBe(`requested-document: ${content}\nsend Operator Message wa Id`);
   });
 
   it("keeps a raw collection raw through an incremental update", async () => {
