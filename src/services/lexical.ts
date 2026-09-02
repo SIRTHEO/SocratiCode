@@ -8,11 +8,20 @@ export interface CommentSyntax {
   line: string[];
   block: Array<[string, string]>;
   strings: string[];
+  /** Line markers count only at line start or after whitespace / `;` (shell: `$#`, `${#x}` are code). */
+  lineNeedsBoundary?: boolean;
+  /** Rust raw strings: `r"…"`, `r#"…"#`, any number of hashes. */
+  rawStrings?: boolean;
+  /** Shell here-documents pass through whole: their body is data or another language's code. */
+  heredocs?: boolean;
+  /** Quoted strings may span lines (shell); elsewhere an unclosed quote ends with its line. */
+  multilineStrings?: boolean;
 }
 
 const C_LIKE: CommentSyntax = { line: ["//"], block: [["/*", "*/"]], strings: ['"', "'", "`"] };
 const C_DQ: CommentSyntax = { line: ["//"], block: [["/*", "*/"]], strings: ['"'] };
 const HASH: CommentSyntax = { line: ["#"], block: [], strings: ['"', "'"] };
+const SHELL: CommentSyntax = { ...HASH, lineNeedsBoundary: true, heredocs: true, multilineStrings: true };
 const CSS_LIKE: CommentSyntax = { line: ["//"], block: [["/*", "*/"]], strings: ['"', "'"] };
 const MARKUP: CommentSyntax = { line: [], block: [["<!--", "-->"]], strings: [] };
 
@@ -30,11 +39,11 @@ const SYNTAX: Record<string, CommentSyntax> = {
   c: C_LIKE,
   cpp: C_LIKE,
   java: C_DQ,
-  rust: C_DQ,
+  rust: { ...C_DQ, rawStrings: true },
   php: { line: ["//", "#"], block: [["/*", "*/"]], strings: ['"', "'"] },
   python: { line: ["#"], block: [], strings: ['"""', "'''", '"', "'"] },
   ruby: HASH,
-  shell: HASH,
+  shell: SHELL,
   yaml: HASH,
   toml: HASH,
   r: HASH,
@@ -63,8 +72,39 @@ export function stripComments(content: string, syntax: CommentSyntax): string {
   const n = content.length;
   let out = "";
   let i = 0;
+  let pendingHeredoc = -1;
 
   while (i < n) {
+    if (pendingHeredoc >= 0 && content[i] === "\n") {
+      out += content.slice(i, pendingHeredoc);
+      i = pendingHeredoc;
+      pendingHeredoc = -1;
+      continue;
+    }
+    if (syntax.heredocs && pendingHeredoc < 0 && content.startsWith("<<", i)) {
+      const j = heredocEnd(content, i);
+      if (j >= 0) {
+        // The rest of the `<<` line is still shell; the body starts at the next newline.
+        const tokenEnd = i + (HEREDOC.exec(content.slice(i, i + 64))?.[0].length ?? 2);
+        out += content.slice(i, tokenEnd);
+        i = tokenEnd;
+        pendingHeredoc = j;
+        continue;
+      }
+    }
+    if (syntax.rawStrings && content[i] === "r" && (i === 0 || !/[\w$]/.test(content[i - 1]))) {
+      let h = i + 1;
+      while (content[h] === "#") h++;
+      if (content[h] === '"') {
+        const close = `"${"#".repeat(h - i - 1)}`;
+        const end = content.indexOf(close, h + 1);
+        const j = end < 0 ? n : end + close.length;
+        out += content.slice(i, j);
+        i = j;
+        continue;
+      }
+    }
+
     const quote = quotes.find((q) => content.startsWith(q, i));
     if (quote) {
       let j = i + quote.length;
@@ -72,7 +112,7 @@ export function stripComments(content: string, syntax: CommentSyntax): string {
         if (content[j] === "\\") { j += 2; continue; }
         if (content.startsWith(quote, j)) { j += quote.length; break; }
         // A single-line literal that never closes ends with its line.
-        if (quote.length === 1 && quote !== "`" && content[j] === "\n") break;
+        if (quote.length === 1 && quote !== "`" && !syntax.multilineStrings && content[j] === "\n") break;
         j++;
       }
       out += content.slice(i, j);
@@ -88,7 +128,8 @@ export function stripComments(content: string, syntax: CommentSyntax): string {
       continue;
     }
 
-    if (syntax.line.some((marker) => content.startsWith(marker, i))) {
+    const atBoundary = !syntax.lineNeedsBoundary || i === 0 || /[\s;]/.test(content[i - 1]);
+    if (atBoundary && syntax.line.some((marker) => content.startsWith(marker, i))) {
       const end = content.indexOf("\n", i);
       i = end < 0 ? n : end;
       continue;
@@ -99,6 +140,21 @@ export function stripComments(content: string, syntax: CommentSyntax): string {
   }
 
   return out;
+}
+
+const HEREDOC = /^<<-?\s*(?:'(\w+)'|"(\w+)"|(\w+))/;
+
+/** Index just past the here-document whose `<<` starts at `i`, or -1 if none starts here. */
+function heredocEnd(content: string, i: number): number {
+  const m = HEREDOC.exec(content.slice(i, i + 64));
+  if (!m) return -1;
+  const tag = m[1] ?? m[2] ?? m[3];
+  const bodyStart = content.indexOf("\n", i);
+  if (bodyStart < 0) return content.length;
+  const close = new RegExp(`^\\t*${tag}$`, "m");
+  const rest = content.slice(bodyStart + 1);
+  const hit = close.exec(rest);
+  return hit ? bodyStart + 1 + hit.index + hit[0].length : content.length;
 }
 
 const IDENTIFIER = /[A-Za-z_$][A-Za-z0-9_$]*/g;

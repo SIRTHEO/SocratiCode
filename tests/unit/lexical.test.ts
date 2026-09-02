@@ -62,6 +62,43 @@ describe("stripComments", () => {
     expect(out).toContain("local y = 2");
   });
 
+  it("keeps shell parameter expansions that contain a hash", () => {
+    const src = `while [ $# -gt 0 ]; do n=\${#FAILED[@]}; done # tail\necho "#not" # gone`;
+    const out = stripComments(src, syntax("shell"));
+    expect(out).toContain("$# -gt 0");
+    expect(out).toContain("$" + "{#FAILED[@]}");
+    expect(out).toContain('"#not"');
+    expect(out).not.toContain("tail");
+    expect(out).not.toContain("gone");
+  });
+
+  it("passes a shell here-document through, its inner hashes and quotes included", () => {
+    const src = "python3 - <<'PY' # run\nimport os  # inner comment stays\nprint(\"it's\")\nPY\necho done # gone";
+    const out = stripComments(src, syntax("shell"));
+    expect(out).toContain("# inner comment stays");
+    expect(out).toContain("print(\"it's\")");
+    expect(out).toContain("echo done");
+    expect(out).not.toContain("run");
+    expect(out).not.toContain("gone");
+  });
+
+  it("lets a shell single-quoted string span lines", () => {
+    const src = "python3 -c 'import os  # not a comment\nprint(1)' # gone\necho ok";
+    const out = stripComments(src, syntax("shell"));
+    expect(out).toContain("# not a comment");
+    expect(out).not.toContain("gone");
+    expect(out).toContain("echo ok");
+  });
+
+  it("passes Rust raw strings through, hashes included", () => {
+    const src = `let a = r#"// not a comment "quoted" "#; // real\nlet b = r"x // y"; fn g() {}`;
+    const out = stripComments(src, syntax("rust"));
+    expect(out).toContain(`r#"// not a comment "quoted" "#`);
+    expect(out).toContain(`r"x // y"`);
+    expect(out).not.toContain("real");
+    expect(out).toContain("fn g() {}");
+  });
+
   it("survives an unterminated block comment", () => {
     expect(stripComments("const a = 1; /* open", ts)).toContain("const a = 1;");
   });
