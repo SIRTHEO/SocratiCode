@@ -132,14 +132,15 @@
         "socraticode.command": {
           "type": "string",
           "default": "npx",
-          "description": "Command used to launch the engine. Defaults to `npx -y socraticode`. Override only if you have a custom install.",
+          "description": "Command used to launch the engine. Defaults to `npx -y --prefer-online socraticode@latest`. Override only if you have a custom install.",
           "scope": "window"
         },
         "socraticode.args": {
           "type": "array",
           "default": [
             "-y",
-            "socraticode"
+            "--prefer-online",
+            "socraticode@latest"
           ],
           "items": {
             "type": "string"
