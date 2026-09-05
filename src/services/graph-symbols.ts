@@ -1862,6 +1862,15 @@ function rustQualifierFromFile(node: any, qualifier: string): string {
 
   let consumed = 0;
   while (consumed < inlineMods && segments[consumed] === "super") consumed += 1;
+
+  // Fewer `super` than inline modules: the path never climbed out of them, so
+  // it is rooted in a module that lives inside this file and has no file of
+  // its own. `mod a { mod b { super::c::f() } }` names the `c` declared beside
+  // `b`, and writing what is left bare hands it to a `mod c;` on the file —
+  // another file entirely, answered as `unique`. The file is what is certain
+  // here, so the file is all this says.
+  if (consumed < inlineMods) return "self";
+
   const rest = segments.slice(consumed);
   // What is left may still climb above the file, and then it is a
   // file-relative `super::` path, which is exactly how it now reads.

@@ -38,7 +38,7 @@ describe("Rust `super::` written inside an inline mod", () => {
 
     write("Cargo.toml", '[package]\nname = "inlinemod"\nedition = "2021"\n');
     write("src/lib.rs", "pub mod a;\npub mod sub;\n");
-    write("src/sub.rs", "pub fn f() -> u32 { 1 }\n");
+    write("src/sub.rs", "pub fn f() -> u32 { 1 }\npub fn h() -> u32 { 8 }\n");
     write("src/a.rs", `pub mod b;
 pub mod sub;
 
@@ -46,12 +46,12 @@ pub fn helper() -> u32 { 2 }
 `);
     write("src/a/sub.rs", "pub fn f() -> u32 { 3 }\n");
     write("src/a/b/sub.rs", "pub fn g() -> u32 { 5 }\n");
+    write("src/a/b/inner.rs", "pub fn probe() -> u32 { 7 }\n");
     write("src/a/b.rs", `pub mod sub;
+pub mod inner;
 use crate::sub as aliased;
 
 pub fn helper() -> u32 { 4 }
-
-pub fn use_the_alias() -> u32 { aliased::f() }
 
 #[cfg(test)]
 mod tests {
@@ -66,8 +66,24 @@ mod tests {
     }
 
     #[test]
+    fn one_hop_then_an_imported_name() {
+        let _ = super::aliased::h();
+    }
+
+    #[test]
     fn two_hops_is_the_parent() {
         let _ = super::super::sub::f();
+    }
+
+    mod deeper {
+        #[test]
+        fn fewer_hops_than_modules() {
+            let _ = super::inner::probe();
+        }
+    }
+
+    mod inner {
+        pub fn probe() -> u32 { 6 }
     }
 }
 `);
@@ -93,7 +109,7 @@ mod tests {
   it("reads one `super` as the file the inline mod is written in", () => {
     // Read one module too high, this answers `src/a.rs::helper` — a file that
     // does declare a `helper`, so the wrong answer arrives as `unique`.
-    expect(candidates.get("helper")).toEqual(["src/a/b.rs::helper#4"]);
+    expect(candidates.get("helper")).toEqual(["src/a/b.rs::helper#5"]);
   });
 
   it("reads two `super` as that file's parent", () => {
@@ -102,9 +118,23 @@ mod tests {
   });
 
   it("keeps what is left of the path relative to that file", () => {
-    // `super::sub` inside the inline mod is `b.rs`'s own `sub` module. `b.rs`
-    // also has `use crate::sub as aliased;`, so a leftover path read as a bare
-    // one would be looked up among the file's bindings before its modules.
+    // `super::sub` inside the inline mod is `b.rs`'s own `sub` module.
     expect(candidates.get("g")).toEqual(["src/a/b/sub.rs::g#1"]);
+  });
+
+  it("lets what is left reach a name the file imported", () => {
+    // `super::aliased` is the file's own `use crate::sub as aliased;`. In Rust
+    // a module's namespace holds the names its `use` declarations bring in, so
+    // the leftover has to stay bare: read as `self::aliased` it would be
+    // matched against the file's modules alone, and answer nothing.
+    expect(candidates.get("h")).toEqual(["src/sub.rs::h#2"]);
+  });
+
+  it("answers with the file when the path never leaves the inline modules", () => {
+    // Two inline modules deep and only one `super`: the path is rooted in
+    // `tests`, which has no file of its own. `b.rs` also declares `mod inner;`
+    // — a different file — so a leftover written bare lands there and says
+    // `unique`. The file is what is certain, and is all this claims.
+    expect(candidates.get("probe")).toEqual(["src/a/b.rs::probe#37"]);
   });
 });
