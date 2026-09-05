@@ -1189,3 +1189,108 @@ describe("Rust qualified calls, across a workspace", () => {
     expect(edge.calleeCandidates).toEqual(["crates/core/util.rs::load#1"]);
   });
 });
+
+describe("Rust qualified calls rooted in `super`", () => {
+  // A module with both a parent and a child of the same name, which is what
+  // separates "read in the parent's scope" from "read in the caller's".
+  const LIB = "crates/x/src/lib.rs";
+  const DEEP = "crates/x/src/deep/mod.rs";
+  const INNER = "crates/x/src/deep/inner.rs";
+  const SIBLING = "crates/x/src/deep/config.rs";
+  const OWN_CHILD = "crates/x/src/deep/inner/config.rs";
+
+  function sym(file: string, name: string, line: number, kind: SymbolNode["kind"]): SymbolNode {
+    return {
+      id: `${file}::${name}#${line}`,
+      name,
+      qualifiedName: name,
+      kind,
+      file,
+      line,
+      endLine: line,
+      language: "rust",
+    };
+  }
+
+  function superGraph(): CodeGraph {
+    return {
+      nodes: [
+        { relativePath: LIB, imports: [], exports: [], dependencies: [DEEP], dependents: [] },
+        {
+          relativePath: DEEP,
+          imports: [],
+          exports: [],
+          dependencies: [INNER, SIBLING],
+          dependents: [LIB],
+        },
+        {
+          relativePath: INNER,
+          imports: [],
+          exports: [],
+          dependencies: [OWN_CHILD],
+          dependents: [DEEP],
+        },
+        { relativePath: SIBLING, imports: [], exports: [], dependencies: [], dependents: [DEEP] },
+        {
+          relativePath: OWN_CHILD,
+          imports: [],
+          exports: [],
+          dependencies: [],
+          dependents: [INNER],
+        },
+      ],
+      edges: [],
+    };
+  }
+
+  /** One qualified call from `inner.rs`, resolved. Returns the edge. */
+  function fromInner(
+    calleeName: string,
+    calleeQualifier: string,
+    bindings?: RustUseBinding[],
+  ): SymbolEdge {
+    const edge: SymbolEdge = {
+      callerId: `${INNER}::inner_caller#1`,
+      calleeName,
+      calleeCandidates: [],
+      confidence: "unresolved",
+      kind: "call",
+      calleeQualifier,
+      callSite: { file: INNER, line: 2 },
+    };
+    resolveCallSites(
+      superGraph(),
+      new Map<string, SymbolNode[]>([
+        [INNER, [sym(INNER, "inner_caller", 1, "function")]],
+        [DEEP, [sym(DEEP, "Widget", 1, "struct"), sym(DEEP, "draw", 4, "function")]],
+        [SIBLING, [sym(SIBLING, "load", 3, "function")]],
+        [OWN_CHILD, [sym(OWN_CHILD, "load", 7, "function")]],
+      ]),
+      new Map<string, SymbolEdge[]>([[INNER, [edge]]]),
+      bindings ? new Map<string, RustUseBinding[]>([[INNER, bindings]]) : undefined,
+    );
+    return edge;
+  }
+
+  it("reads a `use super::` binding in the parent's scope, not the caller's", () => {
+    // `use super::config;` binds the parent's `config`. Dropping the hop and
+    // matching `config` against the caller's own dependencies reaches the
+    // caller's own `inner/config.rs` — the wrong file, stated as `unique`.
+    const edge = fromInner("load", "config", [{ local: "config", path: "super::config" }]);
+    expect(edge.calleeCandidates).toEqual([`${SIBLING}::load#3`]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("reads a `super::` path written at the call site in the parent's scope", () => {
+    const edge = fromInner("load", "super::config");
+    expect(edge.calleeCandidates).toEqual([`${SIBLING}::load#3`]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("finds a type the parent module itself declares", () => {
+    // `super::Widget` is not a module path: the parent declares the type.
+    const edge = fromInner("draw", "super::Widget");
+    expect(edge.calleeCandidates).toEqual([`${DEEP}::draw#4`]);
+    expect(edge.confidence).toBe("unique");
+  });
+});

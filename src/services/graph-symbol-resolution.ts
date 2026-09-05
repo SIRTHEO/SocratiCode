@@ -209,6 +209,23 @@ export function resolveCallSites(
     return candidates.filter((c) => dependents.has(c));
   }
 
+  /**
+   * The scope a `super`-rooted path is read in: the parent modules themselves,
+   * and what they import. `null` when the parent is not reachable, which leaves
+   * the edge unresolved rather than falling back to the caller's own scope —
+   * the caller's scope is a different namespace, and answering out of it is how
+   * `use super::config;` would land on the caller's own `config` submodule.
+   */
+  function parentScopeOf(file: string): { homes: string[]; deps: string[] } | null {
+    const parents = parentModulesOf(file);
+    if (parents.length === 0) return null;
+    const deps = new Set<string>();
+    for (const parent of parents) {
+      for (const dep of depsByFile.get(parent) ?? []) deps.add(dep);
+    }
+    return { homes: parents, deps: [...deps] };
+  }
+
   // Re-export traversal is on the hot path for every unresolved edge. Build
   // this once rather than rescanning every edge in a barrel on every lookup.
   const reexportsByFile = new Map<string, SymbolEdge[]>();
@@ -315,24 +332,25 @@ export function resolveCallSites(
 
     // `self::` and `Self::` name the caller itself. `super::` names its parent,
     // which the remaining segments are then matched against.
+    //
+    // `homes` and `scopeDeps` are the scope the rest of the path is read in:
+    // ordinarily the caller's own file and its dependencies, but under `super::`
+    // the parent module's, because `super::sibling::f()` names a module the
+    // caller may never import.
     let rest = segments;
     let inOwnCrate = false;
+    let homes = [callerFile];
+    let scopeDeps = deps;
     if (segments[0] === "self" || segments[0] === "Self") {
       if (segments.length === 1) return [callerFile];
       rest = segments.slice(1);
     } else if (segments[0] === "super") {
-      // The parent module itself, and then the rest of the path read inside the
-      // parent's own scope rather than the caller's — `super::sibling::f()`
-      // names a module the caller may never import.
-      const parents = parentModulesOf(callerFile);
-      if (parents.length === 0) return null;
-      const tail = segments.slice(1);
-      if (tail.length === 0) return parents;
-      const reached = new Set<string>();
-      for (const parent of parents) {
-        for (const hit of matchModulePath(depsByFile.get(parent) ?? [], tail)) reached.add(hit);
-      }
-      return reached.size > 0 ? [...reached] : null;
+      const parent = parentScopeOf(callerFile);
+      if (!parent) return null;
+      homes = parent.homes;
+      scopeDeps = parent.deps;
+      rest = segments.slice(1);
+      if (rest.length === 0) return homes;
     } else if (segments[0] === "crate") {
       rest = segments.slice(1);
       if (rest.length === 0) return null;
@@ -346,10 +364,22 @@ export function resolveCallSites(
       if (binding) {
         const bound = binding.path.split("::").map((s) => s.trim()).filter(Boolean);
         if (bound[0] === "crate") inOwnCrate = true;
+        if (bound[0] === "super") {
+          // `use super::config;` binds the parent's `config`, so the bound path
+          // is read where `super::config` is read. Stripping the hop and
+          // matching `config` against the caller's own dependencies reaches the
+          // caller's own child module of that name instead — a wrong answer
+          // reported as `unique`.
+          const parent = parentScopeOf(callerFile);
+          if (!parent) return null;
+          homes = parent.homes;
+          scopeDeps = parent.deps;
+        }
         const head = bound[0] === "crate" || bound[0] === "self" || bound[0] === "super"
           ? bound.slice(1)
           : bound;
         rest = [...head, ...segments.slice(1)];
+        if (rest.length === 0) return bound[0] === "super" ? homes : null;
       }
     }
     if (rest.length === 0) return null;
@@ -361,8 +391,8 @@ export function resolveCallSites(
     // answer costs nothing and gets nesting right.
     const mine = rustCrateRootByFile?.get(callerFile);
     const reachable = inOwnCrate && mine !== undefined
-      ? deps.filter((d) => rustCrateRootByFile?.get(d) === mine)
-      : deps;
+      ? scopeDeps.filter((d) => rustCrateRootByFile?.get(d) === mine)
+      : scopeDeps;
 
     // A module path: the dependency whose own path ends with these segments.
     const byPath = matchModulePath(reachable, rest);
@@ -384,7 +414,7 @@ export function resolveCallSites(
       searchIn = matchModulePath(reachable, modulePrefix);
       if (searchIn.length === 0) return null;
     } else {
-      searchIn = [callerFile, ...reachable];
+      searchIn = [...homes, ...reachable];
     }
 
     const declaring = new Set<string>();
