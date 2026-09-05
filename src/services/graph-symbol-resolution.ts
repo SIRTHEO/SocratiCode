@@ -210,20 +210,35 @@ export function resolveCallSites(
   }
 
   /**
-   * The scope a `super`-rooted path is read in: the parent modules themselves,
-   * and what they import. `null` when the parent is not reachable, which leaves
-   * the edge unresolved rather than falling back to the caller's own scope —
-   * the caller's scope is a different namespace, and answering out of it is how
-   * `use super::config;` would land on the caller's own `config` submodule.
+   * The scope a `super`-rooted path is read in, one hop per leading `super`:
+   * the modules reached by climbing, and what they import. `null` when a hop
+   * has no reachable parent, which leaves the edge unresolved rather than
+   * falling back to the caller's own scope — the caller's scope is a different
+   * namespace, and answering out of it is how `use super::config;` would land
+   * on the caller's own `config` submodule.
    */
-  function parentScopeOf(file: string): { homes: string[]; deps: string[] } | null {
-    const parents = parentModulesOf(file);
-    if (parents.length === 0) return null;
-    const deps = new Set<string>();
-    for (const parent of parents) {
-      for (const dep of depsByFile.get(parent) ?? []) deps.add(dep);
+  function climbSuper(
+    callerFile: string,
+    path: string[],
+  ): { homes: string[]; deps: string[]; rest: string[] } | null {
+    let homes = [callerFile];
+    let deps: string[] = [];
+    let rest = path;
+    while (rest[0] === "super") {
+      const parents = new Set<string>();
+      for (const home of homes) {
+        for (const parent of parentModulesOf(home)) parents.add(parent);
+      }
+      if (parents.size === 0) return null;
+      homes = [...parents];
+      const reached = new Set<string>();
+      for (const home of homes) {
+        for (const dep of depsByFile.get(home) ?? []) reached.add(dep);
+      }
+      deps = [...reached];
+      rest = rest.slice(1);
     }
-    return { homes: parents, deps: [...deps] };
+    return { homes, deps, rest };
   }
 
   // Re-export traversal is on the hot path for every unresolved edge. Build
@@ -345,11 +360,11 @@ export function resolveCallSites(
       if (segments.length === 1) return [callerFile];
       rest = segments.slice(1);
     } else if (segments[0] === "super") {
-      const parent = parentScopeOf(callerFile);
-      if (!parent) return null;
-      homes = parent.homes;
-      scopeDeps = parent.deps;
-      rest = segments.slice(1);
+      const climbed = climbSuper(callerFile, segments);
+      if (!climbed) return null;
+      homes = climbed.homes;
+      scopeDeps = climbed.deps;
+      rest = climbed.rest;
       if (rest.length === 0) return homes;
     } else if (segments[0] === "crate") {
       rest = segments.slice(1);
@@ -370,16 +385,19 @@ export function resolveCallSites(
           // matching `config` against the caller's own dependencies reaches the
           // caller's own child module of that name instead — a wrong answer
           // reported as `unique`.
-          const parent = parentScopeOf(callerFile);
-          if (!parent) return null;
-          homes = parent.homes;
-          scopeDeps = parent.deps;
+          const climbed = climbSuper(callerFile, bound);
+          if (!climbed) return null;
+          homes = climbed.homes;
+          scopeDeps = climbed.deps;
+          rest = [...climbed.rest, ...segments.slice(1)];
+          // `use super as up;` binds the parent itself, so `up::f()` is a call
+          // into the parent — the same answer `super::f()` gets.
+          if (rest.length === 0) return homes;
+        } else {
+          const head = bound[0] === "crate" || bound[0] === "self" ? bound.slice(1) : bound;
+          rest = [...head, ...segments.slice(1)];
+          if (rest.length === 0) return null;
         }
-        const head = bound[0] === "crate" || bound[0] === "self" || bound[0] === "super"
-          ? bound.slice(1)
-          : bound;
-        rest = [...head, ...segments.slice(1)];
-        if (rest.length === 0) return bound[0] === "super" ? homes : null;
       }
     }
     if (rest.length === 0) return null;

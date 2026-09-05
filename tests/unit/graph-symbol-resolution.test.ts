@@ -1248,26 +1248,30 @@ describe("Rust qualified calls rooted in `super`", () => {
     calleeName: string,
     calleeQualifier: string,
     bindings?: RustUseBinding[],
+    from: string = INNER,
   ): SymbolEdge {
     const edge: SymbolEdge = {
-      callerId: `${INNER}::inner_caller#1`,
+      callerId: `${from}::caller#1`,
       calleeName,
       calleeCandidates: [],
       confidence: "unresolved",
       kind: "call",
       calleeQualifier,
-      callSite: { file: INNER, line: 2 },
+      callSite: { file: from, line: 2 },
     };
+    const symbols = new Map<string, SymbolNode[]>([
+      [INNER, [sym(INNER, "inner_caller", 1, "function")]],
+      [DEEP, [sym(DEEP, "Widget", 1, "struct"), sym(DEEP, "draw", 4, "function")]],
+      [SIBLING, [sym(SIBLING, "load", 3, "function")]],
+      [OWN_CHILD, [sym(OWN_CHILD, "load", 7, "function")]],
+    ]);
+    // The caller is a symbol in its own file, whatever file that is.
+    symbols.set(from, [...(symbols.get(from) ?? []), sym(from, "caller", 1, "function")]);
     resolveCallSites(
       superGraph(),
-      new Map<string, SymbolNode[]>([
-        [INNER, [sym(INNER, "inner_caller", 1, "function")]],
-        [DEEP, [sym(DEEP, "Widget", 1, "struct"), sym(DEEP, "draw", 4, "function")]],
-        [SIBLING, [sym(SIBLING, "load", 3, "function")]],
-        [OWN_CHILD, [sym(OWN_CHILD, "load", 7, "function")]],
-      ]),
-      new Map<string, SymbolEdge[]>([[INNER, [edge]]]),
-      bindings ? new Map<string, RustUseBinding[]>([[INNER, bindings]]) : undefined,
+      symbols,
+      new Map<string, SymbolEdge[]>([[from, [edge]]]),
+      bindings ? new Map<string, RustUseBinding[]>([[from, bindings]]) : undefined,
     );
     return edge;
   }
@@ -1290,6 +1294,22 @@ describe("Rust qualified calls rooted in `super`", () => {
   it("finds a type the parent module itself declares", () => {
     // `super::Widget` is not a module path: the parent declares the type.
     const edge = fromInner("draw", "super::Widget");
+    expect(edge.calleeCandidates).toEqual([`${DEEP}::draw#4`]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("climbs one module per leading `super`", () => {
+    // `deep/inner/config.rs` → `deep/inner.rs` → `deep/mod.rs`. Consuming only
+    // the first `super` leaves the second in the path, where it matches no
+    // module and the call is lost.
+    const edge = fromInner("draw", "super::super", undefined, OWN_CHILD);
+    expect(edge.calleeCandidates).toEqual([`${DEEP}::draw#4`]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("reads `use super as up;` as the parent module itself", () => {
+    // The bound path is exactly `super`, so `up::draw()` is `super::draw()`.
+    const edge = fromInner("draw", "up", [{ local: "up", path: "super" }]);
     expect(edge.calleeCandidates).toEqual([`${DEEP}::draw#4`]);
     expect(edge.confidence).toBe("unique");
   });
