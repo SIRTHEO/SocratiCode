@@ -1832,6 +1832,42 @@ function extractCalleeInfoRust(fn: any): { name: string; qualifier?: string } | 
   }
 }
 
+/**
+ * A qualifier rewritten as the file itself would have written it.
+ *
+ * `super` counts modules, not files, and an inline `mod` is a module: inside
+ * `#[cfg(test)] mod tests { … }` written in `b.rs`, `super::helper()` means
+ * `b.rs`'s own `helper`, and `super::super::sub::f()` means the `sub` of
+ * `b.rs`'s parent. Resolution knows only files, so it would read both as
+ * relative to the file and answer with the parent's `helper` and the
+ * grandparent's `sub` — not a wider answer, a different one.
+ *
+ * The hops an inline `mod` already accounts for are consumed here, where the
+ * nesting is still visible. A path consumed to nothing is `self`, which is
+ * what it then means. A path with segments left over is written bare, the way
+ * the file itself would write it: bare is the file's own namespace, which is
+ * both its child modules and the names its `use` declarations bring in, and
+ * `self::` would be read as the modules alone.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function rustQualifierFromFile(node: any, qualifier: string): string {
+  const segments = qualifier.split("::");
+  if (segments[0] !== "super") return qualifier;
+
+  let inlineMods = 0;
+  for (let p = node.parent(); p; p = p.parent()) {
+    if (p.kind() === "mod_item") inlineMods += 1;
+  }
+  if (inlineMods === 0) return qualifier;
+
+  let consumed = 0;
+  while (consumed < inlineMods && segments[consumed] === "super") consumed += 1;
+  const rest = segments.slice(consumed);
+  // What is left may still climb above the file, and then it is a
+  // file-relative `super::` path, which is exactly how it now reads.
+  return rest.length === 0 ? "self" : rest.join("::");
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
 function collectRustUseBindings(decl: any, bindings: RustUseBinding[]): void {
   const join = (prefix: string, rest: string): string => (prefix ? `${prefix}::${rest}` : rest);
@@ -2013,7 +2049,9 @@ function extractFromRust(
       callerId: findCallerId(scopes, callLine, moduleSym.id),
       calleeName: callee.name,
       kind: "call",
-      calleeQualifier: callee.qualifier,
+      calleeQualifier: callee.qualifier
+        ? rustQualifierFromFile(node, callee.qualifier)
+        : undefined,
       callSite: { file, line: callLine },
     });
   }

@@ -216,13 +216,16 @@ export function resolveCallSites(
    * falling back to the caller's own scope — the caller's scope is a different
    * namespace, and answering out of it is how `use super::config;` would land
    * on the caller's own `config` submodule.
+   *
+   * A path with no leading `super` climbs nothing and comes back as the
+   * caller's own scope, so calling this on any path is safe.
    */
   function climbSuper(
     callerFile: string,
     path: string[],
   ): { homes: string[]; deps: string[]; rest: string[] } | null {
     let homes = [callerFile];
-    let deps: string[] = [];
+    let deps = depsByFile.get(callerFile) ?? [];
     let rest = path;
     while (rest[0] === "super") {
       const parents = new Set<string>();
@@ -328,9 +331,11 @@ export function resolveCallSites(
    * leaves the edge unresolved, because widening a qualified call to a
    * repository-wide name match is how `Vec::new()` would land on all 191 `new`.
    *
-   * The search never leaves the caller's own scope — its file, its resolved
-   * dependencies, and the re-export chains those reach — so a qualifier can
-   * only ever narrow.
+   * The search stays inside one module's scope — a file, its resolved
+   * dependencies, and the re-export chains those reach. That module is the
+   * caller's own, except under `super::`, where it is the parent the path
+   * names: a different scope, not a wider one, and the only way to answer a
+   * path that points out of the caller's.
    */
   function rustQualifierScope(
     callerFile: string,
