@@ -6,6 +6,7 @@ import {
   computeUnresolvedPct,
   resolveCallSites,
 } from "../../src/services/graph-symbol-resolution.js";
+import type { RustUseBinding } from "../../src/services/graph-symbols.js";
 import type { CodeGraph, SymbolEdge, SymbolNode } from "../../src/types.js";
 
 function mkGraph(): CodeGraph {
@@ -829,5 +830,362 @@ describe("graph-symbol-resolution", () => {
     const indexLocalEdge = outgoing.get("src/index.ts")?.[1];
     expect(indexLocalEdge?.confidence).toBe("local");
     expect(indexLocalEdge?.calleeCandidates).toEqual(["src/index.ts::helper#1"]);
+  });
+});
+
+describe("Rust qualified calls", () => {
+  const LIB = "crates/x/src/lib.rs";
+  const A = "crates/x/src/a.rs";
+  const B = "crates/x/src/b.rs";
+  const INNER = "crates/x/src/deep/inner.rs";
+  const DEEP = "crates/x/src/deep/mod.rs";
+
+  function rustGraph(): CodeGraph {
+    return {
+      nodes: [
+        { relativePath: LIB, imports: [], exports: [], dependencies: [A, B], dependents: [] },
+        { relativePath: A, imports: [], exports: [], dependencies: [], dependents: [LIB] },
+        { relativePath: B, imports: [], exports: [], dependencies: [], dependents: [LIB] },
+        { relativePath: DEEP, imports: [], exports: [], dependencies: [INNER], dependents: [LIB] },
+        // The crate root imports the nested file too, which is ordinary — and
+        // is what makes "a dependent called `lib`" the wrong way to find a
+        // parent: `lib.rs` is a dependent of half the crate.
+        { relativePath: INNER, imports: [], exports: [], dependencies: [], dependents: [DEEP, LIB] },
+      ],
+      edges: [],
+    };
+  }
+
+  function sym(file: string, name: string, line: number, kind: SymbolNode["kind"]): SymbolNode {
+    return {
+      id: `${file}::${name}#${line}`,
+      name,
+      qualifiedName: name,
+      kind,
+      file,
+      line,
+      endLine: line,
+      language: "rust",
+    };
+  }
+
+  function rustSymbols(): Map<string, SymbolNode[]> {
+    return new Map<string, SymbolNode[]>([
+      [LIB, [sym(LIB, "caller", 1, "function"), sym(LIB, "helper", 20, "function")]],
+      [A, [sym(A, "Type", 1, "struct"), sym(A, "method", 5, "function"), sym(A, "run", 9, "function")]],
+      [B, [sym(B, "Type", 1, "struct"), sym(B, "method", 5, "function")]],
+      [DEEP, [sym(DEEP, "shared", 3, "function")]],
+      [INNER, [sym(INNER, "inner_caller", 1, "function")]],
+    ]);
+  }
+
+  /** One qualified call from `caller`, resolved. Returns the edge. */
+  function resolveOne(
+    calleeName: string,
+    calleeQualifier: string | undefined,
+    opts: { from?: string; bindings?: RustUseBinding[] } = {},
+  ): SymbolEdge {
+    const from = opts.from ?? LIB;
+    const edge: SymbolEdge = {
+      callerId: from === LIB ? `${LIB}::caller#1` : `${INNER}::inner_caller#1`,
+      calleeName,
+      calleeCandidates: [],
+      confidence: "unresolved",
+      kind: "call",
+      calleeQualifier,
+      callSite: { file: from, line: 2 },
+    };
+    const outgoing = new Map<string, SymbolEdge[]>([[from, [edge]]]);
+    const bindings = opts.bindings
+      ? new Map<string, RustUseBinding[]>([[from, opts.bindings]])
+      : undefined;
+    resolveCallSites(rustGraph(), rustSymbols(), outgoing, bindings);
+    return edge;
+  }
+
+  it("narrows a `crate::` path to the module it names", () => {
+    const edge = resolveOne("run", "crate::a");
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual([`${A}::run#9`]);
+  });
+
+  it("narrows a bare module path to the module it names", () => {
+    const edge = resolveOne("run", "a");
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual([`${A}::run#9`]);
+  });
+
+  it("reads `self::` as the caller's own file", () => {
+    const edge = resolveOne("helper", "self");
+    expect(edge.confidence).toBe("local");
+    expect(edge.calleeCandidates).toEqual([`${LIB}::helper#20`]);
+  });
+
+  it("reads `super::` as the parent module, which is a dependent and not a dependency", () => {
+    // `mod inner;` is written in the parent, so the parent imports the child:
+    // the only route from `inner.rs` to `deep/mod.rs` is the reverse edge.
+    const edge = resolveOne("shared", "super", { from: INNER });
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual([`${DEEP}::shared#3`]);
+  });
+
+  it("narrows a type qualifier to the file that declares the type", () => {
+    // `method` exists in both a.rs and b.rs. The qualifier is what says which.
+    const edge = resolveOne("method", "Type");
+    expect(edge.confidence).toBe("multiple-candidates");
+    expect(edge.calleeCandidates.sort()).toEqual([`${A}::method#5`, `${B}::method#5`]);
+  });
+
+  it("follows a `use ... as ...` alias to exactly what the original type reaches", () => {
+    // `Type` alone is ambiguous across a.rs and b.rs; the alias names one of
+    // them, so the call must reach that one and nothing else.
+    const edge = resolveOne("method", "Alias", {
+      bindings: [{ local: "Alias", path: "crate::a::Type" }],
+    });
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual([`${A}::method#5`]);
+  });
+
+  it("keeps an external path unresolved, with its qualifier", () => {
+    const edge = resolveOne("copy", "std::fs");
+    expect(edge.confidence).toBe("unresolved");
+    expect(edge.calleeCandidates).toEqual([]);
+    expect(edge.calleeQualifier).toBe("std::fs");
+  });
+
+  it("never falls back to a bare-name match when the qualifier does not resolve", () => {
+    // `run` is declared in a.rs, which the caller depends on, so an unqualified
+    // call to it resolves. Qualified by something this project cannot place, it
+    // must NOT: that fallback is how `Vec::new()` would land on every `new`.
+    const qualified = resolveOne("run", "Unknown");
+    expect(qualified.confidence).toBe("unresolved");
+    expect(qualified.calleeCandidates).toEqual([]);
+
+    const bare = resolveOne("run", undefined);
+    expect(bare.confidence).toBe("unique");
+    expect(bare.calleeCandidates).toEqual([`${A}::run#9`]);
+  });
+
+  it("refuses a qualifier carrying type syntax rather than guessing at it", () => {
+    const edge = resolveOne("go", "<T as Tr>");
+    expect(edge.confidence).toBe("unresolved");
+    expect(edge.calleeCandidates).toEqual([]);
+  });
+
+  it("reads `super::` from the caller's path, not from whatever imports it", () => {
+    // `lib.rs` is a dependent of every file in the crate, because it declares
+    // them. Choosing the parent by name — "a dependent called lib" — therefore
+    // makes the crate root the parent of every file, and `super::` in a nested
+    // module reaches a function Rust cannot see from there.
+    const edge = resolveOne("caller", "super", { from: INNER });
+    expect(edge.confidence).toBe("unresolved");
+    expect(edge.calleeCandidates).toEqual([]);
+  });
+
+  it("keeps `self::` inside the caller's own file", () => {
+    // `run` is in a dependency, not here. `self::` must not reach it: the whole
+    // value of a qualifier is that it excludes.
+    const edge = resolveOne("run", "self");
+    expect(edge.confidence).toBe("unresolved");
+    expect(edge.calleeCandidates).toEqual([]);
+  });
+
+  it("reads a qualifier as Rust only when the caller is Rust", () => {
+    // `rawCallsToUnresolvedEdges` carries the field for every language, and
+    // everything in this branch reads `::`, `crate`, `self` and `super` the way
+    // Rust means them. No other extractor fills it today; the guard is what
+    // keeps the first one that does from silently inheriting Rust's semantics.
+    const graph = rustGraph();
+    graph.nodes.push({
+      relativePath: "src/app.ts",
+      imports: [],
+      exports: [],
+      dependencies: [A],
+      dependents: [],
+    });
+    const symbols = rustSymbols();
+    symbols.set("src/app.ts", [
+      {
+        id: "src/app.ts::caller#1",
+        name: "caller",
+        qualifiedName: "caller",
+        kind: "function",
+        file: "src/app.ts",
+        line: 1,
+        endLine: 1,
+        language: "typescript",
+      },
+    ]);
+    const edge: SymbolEdge = {
+      callerId: "src/app.ts::caller#1",
+      calleeName: "run",
+      calleeCandidates: [],
+      confidence: "unresolved",
+      kind: "call",
+      calleeQualifier: "Unknown",
+      callSite: { file: "src/app.ts", line: 2 },
+    };
+    resolveCallSites(graph, symbols, new Map([["src/app.ts", [edge]]]));
+    // The Rust branch would refuse an unplaceable qualifier; the path every
+    // other language takes finds `run` in the dependency, as it always has.
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual([`${A}::run#9`]);
+  });
+
+  it("matches a module path written as a directory's mod.rs", () => {
+    // `deep::shared()` from lib.rs names `crates/x/src/deep/mod.rs`, whose own
+    // stem is `mod`: matching the file name alone would never find it.
+    const graph = rustGraph();
+    for (const node of graph.nodes) {
+      if (node.relativePath === LIB) node.dependencies = [A, B, DEEP];
+      if (node.relativePath === DEEP) node.dependents = [LIB];
+    }
+    const edge: SymbolEdge = {
+      callerId: `${LIB}::caller#1`,
+      calleeName: "shared",
+      calleeCandidates: [],
+      confidence: "unresolved",
+      kind: "call",
+      calleeQualifier: "deep",
+      callSite: { file: LIB, line: 2 },
+    };
+    resolveCallSites(graph, rustSymbols(), new Map([[LIB, [edge]]]));
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual([`${DEEP}::shared#3`]);
+  });
+});
+
+describe("Rust qualified calls, across a workspace", () => {
+  const ALPHA = "crates/alpha/src/lib.rs";
+  const ALPHA_CFG = "crates/alpha/src/config.rs";
+  const BETA_CFG = "crates/beta/src/config.rs";
+
+  function sym(file: string, name: string, line: number): SymbolNode {
+    return {
+      id: `${file}::${name}#${line}`,
+      name,
+      qualifiedName: name,
+      kind: "function",
+      file,
+      line,
+      endLine: line,
+      language: "rust",
+    };
+  }
+
+  /**
+   * One caller, two `config` modules with a `load`, and a crate boundary drawn
+   * by `crateRoots`. Returns the resolved edge for `<qualifier>::load()`.
+   */
+  function twoCrates(
+    caller: string,
+    ownCfg: string,
+    otherCfg: string,
+    qualifier: string,
+    crateRoots?: Map<string, string>,
+    bindings?: RustUseBinding[],
+  ): SymbolEdge {
+    const graph: CodeGraph = {
+      nodes: [
+        {
+          relativePath: caller,
+          imports: [],
+          exports: [],
+          dependencies: [ownCfg, otherCfg],
+          dependents: [],
+        },
+        { relativePath: ownCfg, imports: [], exports: [], dependencies: [], dependents: [caller] },
+        { relativePath: otherCfg, imports: [], exports: [], dependencies: [], dependents: [caller] },
+      ],
+      edges: [],
+    };
+    const symbols = new Map<string, SymbolNode[]>([
+      [caller, [sym(caller, "go", 1)]],
+      [ownCfg, [sym(ownCfg, "load", 1)]],
+      [otherCfg, [sym(otherCfg, "load", 1)]],
+    ]);
+    const edge: SymbolEdge = {
+      callerId: `${caller}::go#1`,
+      calleeName: "load",
+      calleeCandidates: [],
+      confidence: "unresolved",
+      kind: "call",
+      calleeQualifier: qualifier,
+      callSite: { file: caller, line: 2 },
+    };
+    resolveCallSites(
+      graph,
+      symbols,
+      new Map([[caller, [edge]]]),
+      bindings ? new Map([[caller, bindings]]) : undefined,
+      crateRoots,
+    );
+    return edge;
+  }
+
+  it("keeps `crate::` inside the caller's own crate", () => {
+    // `alpha` depends on `beta`, and both have a `config` module with a `load`.
+    // `crate::config::load()` in alpha has exactly one right answer; reaching
+    // across the boundary it comes back ambiguous, naming a file from another
+    // crate that the caller's `crate::` cannot mean.
+    const roots = new Map([
+      [ALPHA, "crates/alpha/"],
+      [ALPHA_CFG, "crates/alpha/"],
+      [BETA_CFG, "crates/beta/"],
+    ]);
+    const edge = twoCrates(ALPHA, ALPHA_CFG, BETA_CFG, "crate::config", roots);
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual([`${ALPHA_CFG}::load#1`]);
+  });
+
+  it("confines an alias whose path starts at `crate` too", () => {
+    // The boundary has to hold on the route through a binding, not only on a
+    // `crate::` written at the call site.
+    const roots = new Map([
+      [ALPHA, "crates/alpha/"],
+      [ALPHA_CFG, "crates/alpha/"],
+      [BETA_CFG, "crates/beta/"],
+    ]);
+    const edge = twoCrates(ALPHA, ALPHA_CFG, BETA_CFG, "Cfg", roots, [
+      { local: "Cfg", path: "crate::config" },
+    ]);
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual([`${ALPHA_CFG}::load#1`]);
+  });
+
+  it("confines nothing when the whole project is one crate at the root", () => {
+    // tokio's layout: one manifest, sources under `src/`. Every file is in the
+    // same crate, so `crate::` excludes nothing — and a boundary guessed from
+    // the path would cut the crate into one piece per directory and lose the
+    // call entirely.
+    const caller = "src/deep/nested/leaf.rs";
+    const roots = new Map([
+      [caller, ""],
+      ["src/util.rs", ""],
+      ["src/other.rs", ""],
+    ]);
+    const edge = twoCrates(caller, "src/util.rs", "src/other.rs", "crate::util", roots);
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual(["src/util.rs::load#1"]);
+  });
+
+  it("draws the boundary for a crate that has no `src` directory", () => {
+    // ripgrep's layout: `crates/core/main.rs`, `crates/core/util.rs`. The crate
+    // root is the manifest's directory, whatever the sources are called.
+    const caller = "crates/core/flags/defs.rs";
+    const roots = new Map([
+      [caller, "crates/core/"],
+      ["crates/core/util.rs", "crates/core/"],
+      ["crates/grep/util.rs", "crates/grep/"],
+    ]);
+    const edge = twoCrates(
+      caller,
+      "crates/core/util.rs",
+      "crates/grep/util.rs",
+      "crate::util",
+      roots,
+    );
+    expect(edge.confidence).toBe("unique");
+    expect(edge.calleeCandidates).toEqual(["crates/core/util.rs::load#1"]);
   });
 });

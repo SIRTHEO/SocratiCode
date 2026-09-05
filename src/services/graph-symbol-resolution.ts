@@ -18,6 +18,7 @@
  */
 
 import type { CodeGraph, SymbolEdge, SymbolNode } from "../types.js";
+import type { RustUseBinding } from "./graph-symbols.js";
 
 /** Normalize relative path components like `foo/../bar` -> `bar` */
 function normalizePath(p: string): string {
@@ -43,6 +44,39 @@ function stripKnownExt(p: string): string {
   const fileName = lastSlash >= 0 ? p.slice(lastSlash + 1) : p;
   const stripped = fileName.replace(KNOWN_CODE_EXT, "");
   return dir + stripped;
+}
+
+/**
+ * The dependencies whose own path ends with these module segments.
+ *
+ * A Rust module is a file, a directory's `mod.rs`, or a crate's `lib.rs` /
+ * `main.rs`, so `a::b` can be `…/a/b.rs`, `…/a/b/mod.rs` or, when `b` is a
+ * crate, `…/b/src/lib.rs`. All three are matched; anything else is not a module
+ * path and the caller falls through to reading the qualifier as a type.
+ *
+ * Matched against the caller's resolved dependencies only. A path that names a
+ * real module the caller never imports returns nothing, which is the answer
+ * that keeps the qualifier narrowing.
+ */
+function matchModulePath(deps: string[], segments: string[]): string[] {
+  if (segments.length === 0) return [];
+  const wanted = segments.join("/");
+  const hits: string[] = [];
+  for (const dep of deps) {
+    const noExt = stripKnownExt(dep);
+    const tails = [noExt];
+    const last = noExt.slice(noExt.lastIndexOf("/") + 1);
+    if (last === "mod" || last === "lib" || last === "main") {
+      tails.push(noExt.slice(0, noExt.lastIndexOf("/")));
+    }
+    for (const tail of tails) {
+      if (tail === wanted || tail.endsWith(`/${wanted}`)) {
+        hits.push(dep);
+        break;
+      }
+    }
+  }
+  return hits;
 }
 
 /** Resolve an import's module specifier to a dependency file path */
@@ -97,12 +131,29 @@ export function resolveCallSites(
   fileGraph: CodeGraph,
   symbolsByFile: Map<string, SymbolNode[]>,
   outgoingCallsByFile: Map<string, SymbolEdge[]>,
+  /**
+   * Rust `use` bindings per file. Absent for every other language, and absent
+   * when a caller does not have them — resolution then behaves exactly as it
+   * did, which is what keeps a graph built before this readable.
+   */
+  rustBindingsByFile?: Map<string, RustUseBinding[]>,
+  /**
+   * Rust file → the directory prefix of the crate it belongs to, from the
+   * manifests. Absent for every other language, and absent when a caller does
+   * not have it — `crate::` then confines nothing, which is what it did before.
+   */
+  rustCrateRootByFile?: Map<string, string>,
 ): void {
   // Build a fast lookup: file → Map<symbolName, SymbolNode[]>
   const symbolIndexByFile = new Map<string, Map<string, SymbolNode[]>>();
+  // symbol id → the file that declares it. Needed to turn "where is the type
+  // `Foo` declared?" into a scope of files, without taking the file apart from
+  // the id string.
+  const fileOfSymbolId = new Map<string, string>();
   for (const [file, syms] of symbolsByFile.entries()) {
     const idx = new Map<string, SymbolNode[]>();
     for (const s of syms) {
+      fileOfSymbolId.set(s.id, file);
       if (s.name === "<module>") continue;
       const existing = idx.get(s.name);
       if (existing) existing.push(s);
@@ -119,8 +170,43 @@ export function resolveCallSites(
 
   // Build file → dependency files (1-hop from the file-import graph)
   const depsByFile = new Map<string, string[]>();
+  // And the reverse, which is the only way to reach what `super::` names: a
+  // module's parent is the file that declares `mod x;`, so it is a dependent
+  // of the module, never a dependency of it.
+  const dependentsByFile = new Map<string, string[]>();
   for (const node of fileGraph.nodes) {
     depsByFile.set(node.relativePath, node.dependencies.slice());
+    dependentsByFile.set(node.relativePath, node.dependents.slice());
+  }
+
+  /**
+   * The file `super::` names from `file`, if this project has it.
+   *
+   * Computed from the caller's own path and then checked against the
+   * dependents, in that order. Filtering the dependents by name instead — "any
+   * dependent called `lib`" — accepts the crate root as the parent of every
+   * file in the crate, because the crate root imports them all: `super::x()`
+   * in `a/b/leaf.rs` would then reach `src/lib.rs`, which Rust does not allow
+   * and the graph would state as `unique`.
+   *
+   * `a/b/leaf.rs` has parent `a/b/mod.rs`, or `a/b.rs` when the module is
+   * written beside its directory. `a/b/mod.rs` is itself the module `a::b`, so
+   * its parent is one level further up.
+   */
+  function parentModulesOf(file: string): string[] {
+    const noExt = stripKnownExt(file);
+    const stem = noExt.slice(noExt.lastIndexOf("/") + 1);
+    let dir = file.slice(0, file.lastIndexOf("/"));
+    // A module root stands for its own directory, so its parent is the
+    // directory above.
+    if (stem === "mod" || stem === "lib" || stem === "main") {
+      if (!dir.includes("/")) return [];
+      dir = dir.slice(0, dir.lastIndexOf("/"));
+    }
+    if (!dir) return [];
+    const candidates = [`${dir}/mod.rs`, `${dir}.rs`, `${dir}/lib.rs`, `${dir}/main.rs`];
+    const dependents = new Set(dependentsByFile.get(file) ?? []);
+    return candidates.filter((c) => dependents.has(c));
   }
 
   // Re-export traversal is on the hot path for every unresolved edge. Build
@@ -204,12 +290,147 @@ export function resolveCallSites(
     return candidates;
   }
 
+  /**
+   * The files a Rust qualifier names, or `null` when it names none that this
+   * project can reach. `null` is not "resolve it some other way": the caller
+   * leaves the edge unresolved, because widening a qualified call to a
+   * repository-wide name match is how `Vec::new()` would land on all 191 `new`.
+   *
+   * The search never leaves the caller's own scope — its file, its resolved
+   * dependencies, and the re-export chains those reach — so a qualifier can
+   * only ever narrow.
+   */
+  function rustQualifierScope(
+    callerFile: string,
+    qualifier: string,
+    deps: string[],
+    bindings: RustUseBinding[],
+  ): string[] | null {
+    const segments = qualifier.split("::").map((s) => s.trim()).filter(Boolean);
+    if (segments.length === 0) return null;
+
+    // `<T as Tr>::go()` and anything else the grammar hands back with syntax in
+    // it: not a path this can follow.
+    if (qualifier.includes("<") || qualifier.includes(">")) return null;
+
+    // `self::` and `Self::` name the caller itself. `super::` names its parent,
+    // which the remaining segments are then matched against.
+    let rest = segments;
+    let inOwnCrate = false;
+    if (segments[0] === "self" || segments[0] === "Self") {
+      if (segments.length === 1) return [callerFile];
+      rest = segments.slice(1);
+    } else if (segments[0] === "super") {
+      // The parent module itself, and then the rest of the path read inside the
+      // parent's own scope rather than the caller's — `super::sibling::f()`
+      // names a module the caller may never import.
+      const parents = parentModulesOf(callerFile);
+      if (parents.length === 0) return null;
+      const tail = segments.slice(1);
+      if (tail.length === 0) return parents;
+      const reached = new Set<string>();
+      for (const parent of parents) {
+        for (const hit of matchModulePath(depsByFile.get(parent) ?? [], tail)) reached.add(hit);
+      }
+      return reached.size > 0 ? [...reached] : null;
+    } else if (segments[0] === "crate") {
+      rest = segments.slice(1);
+      if (rest.length === 0) return null;
+      // Confined to the caller's own crate, which is what `crate::` means.
+      inOwnCrate = true;
+    } else {
+      // An imported binding rewrites the head into the path it names, so
+      // `use crate::a::Type as Alias` makes `Alias::method()` reach exactly
+      // what `crate::a::Type::method()` reaches and nothing else.
+      const binding = bindings.find((b) => b.local === segments[0]);
+      if (binding) {
+        const bound = binding.path.split("::").map((s) => s.trim()).filter(Boolean);
+        if (bound[0] === "crate") inOwnCrate = true;
+        const head = bound[0] === "crate" || bound[0] === "self" || bound[0] === "super"
+          ? bound.slice(1)
+          : bound;
+        rest = [...head, ...segments.slice(1)];
+      }
+    }
+    if (rest.length === 0) return null;
+
+    // Same crate, by identity rather than by prefix. A prefix is a superset:
+    // `""` for a package at the project root also covers a crate in `sub/`,
+    // and `crates/alpha/` covers one nested at `crates/alpha/inner/beta`. The
+    // map already says which crate each file belongs to, so comparing that
+    // answer costs nothing and gets nesting right.
+    const mine = rustCrateRootByFile?.get(callerFile);
+    const reachable = inOwnCrate && mine !== undefined
+      ? deps.filter((d) => rustCrateRootByFile?.get(d) === mine)
+      : deps;
+
+    // A module path: the dependency whose own path ends with these segments.
+    const byPath = matchModulePath(reachable, rest);
+    if (byPath.length > 0) return byPath;
+
+    // A type qualifier: the files, within reach, that declare that name. The
+    // last segment is the type — `crate::a::Type::method()` qualifies `method`
+    // with `crate::a::Type`.
+    //
+    // Anything before it is a module path and it is not decoration: it says
+    // *which* `Type`. Looked up without it, an alias for `crate::a::Type` would
+    // reach `b.rs`'s `Type` as well, which is the opposite of what an alias is
+    // for. When that prefix names no reachable module the answer is nothing,
+    // not everything — a qualifier narrows or it fails.
+    const typeName = rest[rest.length - 1];
+    const modulePrefix = rest.slice(0, -1);
+    let searchIn: string[];
+    if (modulePrefix.length > 0) {
+      searchIn = matchModulePath(reachable, modulePrefix);
+      if (searchIn.length === 0) return null;
+    } else {
+      searchIn = [callerFile, ...reachable];
+    }
+
+    const declaring = new Set<string>();
+    for (const file of searchIn) {
+      for (const id of findSymbolsInTarget(file, typeName)) {
+        const declaredIn = fileOfSymbolId.get(id);
+        if (declaredIn) declaring.add(declaredIn);
+      }
+    }
+    if (declaring.size > 0) return [...declaring];
+
+    return null;
+  }
+
   for (const [callerFile, edges] of outgoingCallsByFile.entries()) {
     const localIdx = symbolIndexByFile.get(callerFile);
     const deps = depsByFile.get(callerFile) ?? [];
+    const bindings = rustBindingsByFile?.get(callerFile) ?? [];
 
     for (const edge of edges) {
       const candidates: string[] = [];
+
+      // A qualified call is resolved by its qualifier or not at all.
+      //
+      // Gated on the caller being Rust, not merely on the field being present.
+      // Everything below reads `::`, `crate`, `self` and `super` as Rust means
+      // them, and `rawCallsToUnresolvedEdges` carries `calleeQualifier` for
+      // every language — so the day another extractor fills it, this would
+      // apply Rust's semantics to it silently.
+      if (edge.calleeQualifier && callerFile.endsWith(".rs")) {
+        const scope = rustQualifierScope(callerFile, edge.calleeQualifier, deps, bindings);
+        if (scope) {
+          for (const file of scope) candidates.push(...findSymbolsInTarget(file, edge.calleeName));
+        }
+        const uniq = Array.from(new Set(candidates));
+        edge.calleeCandidates = uniq;
+        if (uniq.length === 0) edge.confidence = "unresolved";
+        // `self::helper()` lands in the caller's own file, which is what
+        // `local` has always meant here — the qualifier changes how it was
+        // found, not where it was found.
+        else if (uniq.every((id) => fileOfSymbolId.get(id) === callerFile)) {
+          edge.confidence = "local";
+        } else if (uniq.length === 1) edge.confidence = "unique";
+        else edge.confidence = "multiple-candidates";
+        continue;
+      }
 
       // 1. Local (unless edge explicitly specifies an external source module)
       if (!edge.sourceModule) {

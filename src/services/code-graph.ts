@@ -18,7 +18,12 @@ import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
 import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
-import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
+import {
+  extractSymbolsAndCalls,
+  type RustUseBinding,
+  rawCallsToUnresolvedEdges,
+} from "./graph-symbols.js";
+
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import { logger } from "./logger.js";
 import { deleteGraphData, describeQdrantError, getGraphMetadata, loadGraphData, saveGraphData } from "./qdrant.js";
@@ -242,7 +247,13 @@ async function doRebuildGraph(
     if (!opts.skipSymbolGraph) {
       try {
         progress.phase = "resolving symbols";
-        resolveCallSites(graph, built.symbolsByFile, built.outgoingCallsByFile);
+        resolveCallSites(
+          graph,
+          built.symbolsByFile,
+          built.outgoingCallsByFile,
+          built.rustBindingsByFile,
+          built.rustCrateRootByFile,
+        );
 
         progress.phase = "persisting symbols";
         await persistSymbolGraph(projectId, resolvedPath, built.symbolsByFile, built.outgoingCallsByFile);
@@ -801,6 +812,10 @@ export async function buildCodeGraph(
 ): Promise<CodeGraph & {
   symbolsByFile: Map<string, SymbolNode[]>;
   outgoingCallsByFile: Map<string, SymbolEdge[]>;
+  /** Rust `use` bindings per file — resolution input only, never persisted. */
+  rustBindingsByFile: Map<string, RustUseBinding[]>;
+  /** Rust file → its crate's directory prefix. Resolution input only. */
+  rustCrateRootByFile: Map<string, string>;
 }> {
   ensureDynamicLanguages();
 
@@ -823,6 +838,7 @@ export async function buildCodeGraph(
   const edges: CodeGraphEdge[] = [];
   const symbolsByFile = new Map<string, SymbolNode[]>();
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
+  const rustBindingsByFile = new Map<string, RustUseBinding[]>();
 
   // Per-reason counts, holding only the reasons that actually fired — the build log
   // emits `skipReasons` straight from this map, so it never carries a zero.
@@ -935,6 +951,28 @@ export async function buildCodeGraph(
   const hasRust = files.some((f) => path.extname(f).toLowerCase() === ".rs");
   const rustCrates = hasRust ? buildRustCrateMap(fileSet, resolvedPath) : undefined;
 
+  // Which crate each Rust file belongs to, as a path prefix. `crate::` is
+  // relative to a crate's own root module, so resolution needs the boundary —
+  // and the manifests are what draw it. Deriving it from the path instead
+  // means guessing at a layout: a marker like `src/` misses a crate that has
+  // no `src/` directory (ripgrep) and misreads one whose sources start at the
+  // project root (tokio), and the guess fails silently in both.
+  //
+  // The owning crate is the one whose directory contains the file and is
+  // deepest, with the workspace root at `"."` ranking as no depth at all —
+  // the same rule the import resolver settled on. A crate at the root confines
+  // nothing, which is correct: there is only one crate to be in.
+  const rustCrateRootByFile = new Map<string, string>();
+  if (rustCrates && rustCrates.length > 0) {
+    const depthOf = (crate: { dir: string }): number => (crate.dir === "." ? 0 : crate.dir.length);
+    const ranked = [...rustCrates].sort((a, b) => depthOf(b) - depthOf(a));
+    for (const relPath of files) {
+      if (!relPath.endsWith(".rs")) continue;
+      const owner = ranked.find((c) => c.dir === "." || relPath.startsWith(`${c.dir}/`));
+      if (owner) rustCrateRootByFile.set(relPath, owner.dir === "." ? "" : `${owner.dir}/`);
+    }
+  }
+
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
     let lang = getAstGrepLang(ext);
@@ -1043,6 +1081,9 @@ export async function buildCodeGraph(
       const extracted = extractSymbolsAndCalls(source, extractionLang, ext, relPath);
       symbolsByFile.set(relPath, extracted.symbols);
       outgoingCallsByFile.set(relPath, rawCallsToUnresolvedEdges(extracted.rawCalls));
+      if (extracted.bindings && extracted.bindings.length > 0) {
+        rustBindingsByFile.set(relPath, extracted.bindings);
+      }
     } catch (err) {
       logger.debug("Symbol extraction failed (continuing)", {
         file: relPath,
@@ -1136,5 +1177,7 @@ export async function buildCodeGraph(
     edges,
     symbolsByFile,
     outgoingCallsByFile,
+    rustBindingsByFile,
+    rustCrateRootByFile,
   };
 }

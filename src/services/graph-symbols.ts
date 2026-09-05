@@ -14,6 +14,25 @@ import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templ
 import { logger } from "./logger.js";
 
 /** Result of extracting symbols + raw call sites from a file. */
+/**
+ * One name a Rust `use` puts in a file's own scope, and the path it names.
+ *
+ * The file-import graph cannot supply this: `rustUseLeafPath` strips the alias
+ * before the path is ever recorded, and `ImportInfo` has no field for a local
+ * binding. Without it, `use crate::a::Type as Alias;` followed by
+ * `Alias::method()` leaves the qualifier `Alias` naming nothing.
+ *
+ * Kept out of the persisted graph on purpose. It is an input to resolution,
+ * which runs once per full build and in the same process as extraction, so
+ * nothing needs to store it and no payload changes shape.
+ */
+export interface RustUseBinding {
+  /** The name written in this file — the alias when there is one. */
+  local: string;
+  /** The path it names, alias excluded: `crate::a::Type`, `std::fs`. */
+  path: string;
+}
+
 export interface ExtractedSymbols {
   symbols: SymbolNode[];
   /** Outgoing call sites — `calleeCandidates` and `confidence` are filled later by resolution. */
@@ -24,8 +43,15 @@ export interface ExtractedSymbols {
     sourceModule?: string;
     importedName?: string;
     localAlias?: string;
+    /**
+     * The path qualifying the callee, terminal name excluded: `Vec` in
+     * `Vec::new()`, `std::fs` in `std::fs::copy()`. Absent on a bare call.
+     */
+    calleeQualifier?: string;
     callSite: { file: string; line: number };
   }>;
+  /** Rust `use` bindings declared by this file. Absent for every other language. */
+  bindings?: RustUseBinding[];
 }
 
 /** Build a stable SymbolNode.id. */
@@ -1733,6 +1759,129 @@ function extractFromGo(
 
 // ── Rust ─────────────────────────────────────────────────────────────────
 
+/**
+ * Every name a file's `use` declarations put in its own scope, paired with the
+ * path each names. Walked over the tree rather than over the text, because the
+ * alias is what is wanted and the text-level helpers in `graph-imports.ts`
+ * delete it: `rustUseLeafPath` strips ` as X` before returning the path.
+ *
+ * A nested list carries its prefix down (`use a::{b, c as d}` binds `b` to
+ * `a::b` and `d` to `a::c`), and `self` in a list binds the prefix's own last
+ * segment (`use a::{self}` binds `a`). A wildcard binds no name and is skipped:
+ * what it brings into scope cannot be known from this file alone, and guessing
+ * would widen resolution rather than narrow it.
+ */
+/**
+ * A path with its turbofish removed: `Vec::<Option<u8>>` → `Vec`. Scanned for
+ * the matching `>` rather than matched with `::<[^>]*>`, which stops at the
+ * first `>` and leaves a stray one behind on a nested generic.
+ */
+function stripTurbofish(path: string): string {
+  let out = "";
+  for (let i = 0; i < path.length; i++) {
+    if (path[i] === ":" && path.slice(i, i + 3) === "::<") {
+      let depth = 0;
+      let j = i + 2;
+      for (; j < path.length; j++) {
+        if (path[j] === "<") depth++;
+        else if (path[j] === ">" && --depth === 0) break;
+      }
+      i = j;
+      continue;
+    }
+    out += path[i];
+  }
+  return out;
+}
+
+/**
+ * The callee of a Rust call, split into the terminal name and the path that
+ * qualifies it. Read off the `function` field rather than scanned out of the
+ * node's text, which is what `extractCalleeNameJs` did and why every qualified
+ * call was dropped: its chain pattern `[\w$.]+` stops dead at the `:` of `::`.
+ *
+ * A chain needs no special case here. ast-grep reports one `call_expression`
+ * per link, and each link's own `function` field names only that link, so
+ * `Path::new(p).components().all(f)` yields `all`, `components` and `new`
+ * rather than nothing.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function extractCalleeInfoRust(fn: any): { name: string; qualifier?: string } | null {
+  if (!fn) return null;
+  switch (fn.kind()) {
+    case "identifier":
+      return { name: fn.text() };
+    // `obj.method()` — the receiver is an expression, not a path, so there is
+    // nothing to narrow with. The name alone is what this call knows.
+    case "field_expression": {
+      const field = fn.field("field");
+      return field ? { name: field.text() } : null;
+    }
+    case "scoped_identifier": {
+      const name = fn.field("name");
+      if (!name) return null;
+      const path = fn.field("path");
+      const qualifier = path ? stripTurbofish(path.text()).trim() : "";
+      return qualifier ? { name: name.text(), qualifier } : { name: name.text() };
+    }
+    // `foo::<T>()` — the turbofish sits on the function itself.
+    case "generic_function":
+      return extractCalleeInfoRust(fn.field("function"));
+    default:
+      return null;
+  }
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function collectRustUseBindings(decl: any, bindings: RustUseBinding[]): void {
+  const join = (prefix: string, rest: string): string => (prefix ? `${prefix}::${rest}` : rest);
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const walk = (node: any, prefix: string): void => {
+    switch (node.kind()) {
+      case "use_as_clause": {
+        const pathNode = node.field("path");
+        const aliasNode = node.field("alias");
+        if (!pathNode || !aliasNode) return;
+        bindings.push({ local: aliasNode.text(), path: join(prefix, pathNode.text()) });
+        return;
+      }
+      case "scoped_use_list": {
+        const listNode = node.field("list");
+        if (!listNode) return;
+        const pathNode = node.field("path");
+        const inner = pathNode ? join(prefix, pathNode.text()) : prefix;
+        // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+        for (const child of listNode.children()) walk(child as any, inner);
+        return;
+      }
+      case "use_list": {
+        // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+        for (const child of node.children()) walk(child as any, prefix);
+        return;
+      }
+      case "identifier":
+      case "scoped_identifier": {
+        const text = node.text();
+        const local = text.split("::").pop() ?? text;
+        bindings.push({ local, path: join(prefix, text) });
+        return;
+      }
+      case "self": {
+        const last = prefix.split("::").pop();
+        if (last) bindings.push({ local: last, path: prefix });
+        return;
+      }
+      default:
+        // `use`, `;`, `{`, `}`, `,`, a visibility modifier, `use_wildcard`.
+        return;
+    }
+  };
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  for (const child of decl.children()) walk(child as any, "");
+}
+
 function extractFromRust(
   source: string,
   file: string,
@@ -1745,6 +1894,7 @@ function extractFromRust(
   // the only key that orders two declarations sharing a line. See the sort at
   // the end of this function.
   const declared: Array<{ sym: SymbolNode; offset: number }> = [];
+  const bindings: RustUseBinding[] = [];
 
   for (const fn of safeFindAll(root, "function_item")) {
     const nameNode = safeFind(fn, "identifier");
@@ -1778,10 +1928,16 @@ function extractFromRust(
   // `function_item`, and an associated `type` or `const` through this table —
   // under a bare name, without the implementing type, the way a method's name
   // is already bare. Two impls of one trait therefore yield two symbols of the
-  // same associated name; the trait's own `type Item;` yields none, being an
-  // `associated_type` rather than a `type_item`. Both are stated in the pull
-  // request as limits rather than fixed here: qualifying a name is a change to
-  // how every language in this file names a member.
+  // same associated name: reported as a limit rather than fixed, because
+  // qualifying a name is a change to how every language in this file names a
+  // member.
+  //
+  // A declaration without a body is still a declaration. `function_signature_item`
+  // covers both places Rust puts one — a method declared in a trait, and a `fn`
+  // inside an `extern` block — and `associated_type` is the trait's own
+  // `type Item;`, which is a different node from the `type_item` an impl writes.
+  // Reading only the definitions meant a reader who found a trait could not find
+  // anything the trait declares.
   //
   // A `use` is genuinely not an item: what it names is declared elsewhere, and
   // the file graph already carries that edge.
@@ -1804,13 +1960,26 @@ function extractFromRust(
     ["enum_item", "enum"],
     ["trait_item", "trait"],
     ["type_item", "type"],
+    ["associated_type", "type"],
     ["const_item", "variable"],
     ["static_item", "variable"],
+    ["function_signature_item", "function"],
   ]);
   // One pass, not one per kind: `findAll` walks the whole tree each time it is
-  // called, so seven calls read the file seven times. Measured on ripgrep's
-  // `crates/core/flags/defs.rs`, seven passes cost +51% over `main` on this
-  // function and one costs +18%.
+  // called, so one call per kind reads the file once per kind. Measured on
+  // ripgrep's `crates/core/flags/defs.rs`, seven separate passes cost +51% over
+  // reading no items at all, where one pass costs +18%.
+  // Only the `use` declarations at the top of the file, which are the ones
+  // whose names are in scope for the whole file. A `use` written inside a `fn`
+  // or a `mod x { }` binds a name **there**, and treating it as the file's
+  // would let it point a call in a different scope at a different type — a
+  // wrong answer stated as `unique`, which is worse than no answer. Reading
+  // `root.children()` costs nothing: it does not descend.
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  for (const child of root.children() as any[]) {
+    if (child.kind() === "use_declaration") collectRustUseBindings(child, bindings);
+  }
+
   for (const item of safeFindAllAny(root, [...RUST_ITEM_KINDS.keys()])) {
     const symbolKind = RUST_ITEM_KINDS.get(item.kind());
     if (!symbolKind) continue;
@@ -1836,14 +2005,15 @@ function extractFromRust(
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
   for (const node of safeFindAll(root, "call_expression")) {
-    const calleeName = extractCalleeNameJs(node.text());
-    if (!calleeName) continue;
+    const callee = extractCalleeInfoRust(node.field("function"));
+    if (!callee) continue;
     const r = node.range();
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName,
+      calleeName: callee.name,
       kind: "call",
+      calleeQualifier: callee.qualifier,
       callSite: { file, line: callLine },
     });
   }
@@ -1878,7 +2048,7 @@ function extractFromRust(
   declared.sort((a, b) => a.offset - b.offset);
   const symbols: SymbolNode[] = [moduleSym, ...declared.map((d) => d.sym)];
 
-  return { symbols, rawCalls };
+  return { symbols, rawCalls, bindings };
 }
 
 // ── JVM (Java / Kotlin / Scala) ──────────────────────────────────────────
@@ -2468,6 +2638,7 @@ export function rawCallsToUnresolvedEdges(
     sourceModule: c.sourceModule,
     importedName: c.importedName,
     localAlias: c.localAlias,
+    calleeQualifier: c.calleeQualifier,
     callSite: c.callSite,
   }));
 }
