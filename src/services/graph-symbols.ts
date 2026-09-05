@@ -1864,11 +1864,17 @@ function rustQualifierFromFile(node: any, qualifier: string): string {
   while (consumed < inlineMods && segments[consumed] === "super") consumed += 1;
 
   // Fewer `super` than inline modules: the path never climbed out of them, so
-  // it is rooted in a module that lives inside this file and has no file of
-  // its own. `mod a { mod b { super::c::f() } }` names the `c` declared beside
-  // `b`, and writing what is left bare hands it to a `mod c;` on the file —
-  // another file entirely, answered as `unique`. The file is what is certain
-  // here, so the file is all this says.
+  // it is rooted in a module that lives inside this file. `mod a { mod b {
+  // super::c::f() } }` names the `c` declared beside `b`, and writing what is
+  // left bare hands it to a `mod c;` on the file — another file entirely,
+  // answered as `unique`.
+  //
+  // What is left is dropped rather than followed, because two shapes are
+  // spelled the same and only one has a file to point at: `c` may be an inline
+  // module, and it may be a file module that an inline module declares —
+  // `mod a { pub mod c; }` in `x.rs` is `x/a/c.rs`, which tokio writes 23
+  // times. The file is what is certain either way, so the file is all this
+  // says, and the second shape is left unresolved rather than answered wrong.
   if (consumed < inlineMods) return "self";
 
   const rest = segments.slice(consumed);
