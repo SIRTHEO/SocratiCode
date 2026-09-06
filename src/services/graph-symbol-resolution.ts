@@ -101,6 +101,33 @@ function matchModulePath(deps: string[], segments: string[]): string[] {
   return hits;
 }
 
+/**
+ * The directory a module's own children are filed in.
+ *
+ * Rust files a submodule beside its parent, not beside the parent's file:
+ * `src/lib.rs` and `src/a/mod.rs` both take their children from the directory
+ * they stand for (`src/` and `src/a/`), while `src/a.rs` takes its children
+ * from `src/a/` — the directory named after it, which does not hold the file
+ * itself.
+ *
+ * A crate root takes them from its own directory whatever it is called, which
+ * the stem alone does not say: cargo 1.90.0 on `src/bin/x.rs` writing
+ * `mod helper;` answers `file not found for module helper … create file
+ * "src/bin/helper.rs"`, not `src/bin/x/helper.rs`, and a `tests/t.rs` with
+ * `mod support;` compiles against `tests/support.rs`. So `isCrateRoot` is
+ * asked, and not guessed from the name.
+ */
+function childModuleDirOf(file: string, isCrateRoot: boolean): string {
+  const noExt = stripKnownExt(file);
+  const lastSlash = file.lastIndexOf("/");
+  // A file at the project root has no directory, and `""` is the answer:
+  // `file.slice(0, -1)` is the name with its last letter cut off.
+  const dir = lastSlash >= 0 ? file.slice(0, lastSlash) : "";
+  const stem = noExt.slice(noExt.lastIndexOf("/") + 1);
+  if (isCrateRoot || stem === "mod" || stem === "lib" || stem === "main") return dir;
+  return dir ? `${dir}/${stem}` : stem;
+}
+
 /** Resolve an import's module specifier to a dependency file path */
 function resolveDepFile(callerFile: string, sourceModule: string, deps: string[]): string | null {
   if (!sourceModule) return null;
@@ -261,6 +288,82 @@ export function resolveCallSites(
       : ["lib.rs", "main.rs"];
     const dependents = new Set(dependentsByFile.get(file) ?? []);
     return candidates.filter((c) => dependents.has(c));
+  }
+
+  /**
+   * Whether Cargo compiles this file as a crate of its own: a binary under
+   * `src/bin/`, an integration test, an example, a benchmark, or the library
+   * root itself. It decides where the file's own submodules are filed, and it
+   * is the same question {@link crateRootFilesOf} answers for `crate::` — a
+   * file whose `crate::` starts at itself *is* a root — so it is asked there
+   * rather than restated as a second pattern that could drift from it.
+   */
+  function isOwnCrateRoot(file: string): boolean {
+    const roots = crateRootFilesOf(file);
+    return roots?.length === 1 && roots[0] === file;
+  }
+
+  /**
+   * The files one module declares under the name `segment` — one hop of a
+   * module path.
+   *
+   * Two things have to hold, and each rules out a different wrong answer.
+   *
+   * The file has to sit where Rust files a child of *this* module:
+   * `<childDir>/<segment>.rs` or `<childDir>/<segment>/mod.rs`. A file graph's
+   * dependencies mix `mod x;` with `use`, so `a/mod.rs` that writes
+   * `use crate::other::b;` depends on `other/b.rs` — and a hop that asked only
+   * "is it a dependency called `b`?" would read `crate::a::b` as
+   * `crate::other::b`.
+   *
+   * And the parent has to actually depend on it, which is the graph's record
+   * that the declaration was written. Two files can sit at the two spellings of
+   * one module, which rustc rejects (E0761) and a graph merely reports; taking
+   * both is honest about it, and the caller turns two answers into
+   * `multiple-candidates` rather than picking one.
+   */
+  function childModulesOf(parent: string, segment: string): string[] {
+    // A segment that is not a plain identifier is not a module name, and
+    // pasting it into a path is how `..` would climb out of the crate.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(segment)) return [];
+    const dir = childModuleDirOf(parent, isOwnCrateRoot(parent));
+    const candidates = dir
+      ? [`${dir}/${segment}.rs`, `${dir}/${segment}/mod.rs`]
+      : [`${segment}.rs`, `${segment}/mod.rs`];
+    const deps = new Set(depsByFile.get(parent) ?? []);
+    return candidates.filter((c) => deps.has(c));
+  }
+
+  /**
+   * The files a module path names, walked one segment at a time from `homes`.
+   *
+   * `crate::a::b` is two hops, not one suffix: the crate root declares `a` and
+   * `a` declares `b`, and no single file has to depend on `a/b.rs` for the path
+   * to be real. Matching the whole qualifier against the caller's own
+   * dependencies instead both missed those — the graph reaches `a/mod.rs` and
+   * stops — and answered too widely, because a suffix is not a path:
+   * `crate::task` in tokio's `runtime/tests/task.rs` came back as
+   * `runtime/task/mod.rs`, a file that path does not name, only because the
+   * caller imports it and `task` is the tail of its directory.
+   *
+   * A hop that finds nothing ends the walk with nothing. That is the whole
+   * guarantee: the answer is a module the path really reaches, or the edge
+   * stays unresolved with its qualifier.
+   *
+   * Every hop moves strictly deeper into the tree, so the walk cannot cycle.
+   */
+  function walkModulePath(homes: string[], segments: string[]): string[] {
+    if (segments.length === 0) return [];
+    let frontier = homes;
+    for (const segment of segments) {
+      const next = new Set<string>();
+      for (const file of frontier) {
+        for (const child of childModulesOf(file, segment)) next.add(child);
+      }
+      if (next.size === 0) return [];
+      frontier = [...next];
+    }
+    return frontier;
   }
 
   /** The root modules of one crate directory, in the order Cargo looks. */
@@ -620,9 +723,45 @@ export function resolveCallSites(
     const reachable = inOwnCrate && mine !== undefined
       ? scopeDeps.filter((d) => rustCrateRootByFile?.get(d) === mine)
       : scopeDeps;
+    const confine = (files: string[]): string[] =>
+      inOwnCrate && mine !== undefined
+        ? files.filter((f) => rustCrateRootByFile?.get(f) === mine)
+        : files;
 
-    // A module path: the dependency whose own path ends with these segments.
-    const byPath = matchModulePath(reachable, rest);
+    /**
+     * The files a module path names: walked from the scope the path starts in,
+     * and only where the walk comes back empty, matched by suffix as before.
+     *
+     * The walk speaks first because it is the one that can be wrong in the
+     * direction that matters. Ordering it first is what turns tokio's
+     * `crate::task::yield_now()` from `runtime/task/mod.rs` — a file that path
+     * does not name, reached because the caller imports it and `task` is the
+     * tail of its directory — into the honest `unresolved`.
+     *
+     * The suffix is kept underneath rather than deleted because the walk needs
+     * the module tree to be visible in the file graph, and four things hide it:
+     * a `mod` written inside a macro, an inline `mod x { … }` block that has no
+     * file of its own, a `use` re-binding in an ancestor module (Rust resolves
+     * `super::queue` through one), and a crate root named by `[[bin]] path =`
+     * rather than by its location.
+     *
+     * Measured over ripgrep 14.1.1, tokio 1.40.0 and Sailor: 46 edges that
+     * resolve today are ones the walk alone does not reach — 28 in tokio, 18 in
+     * ripgrep, none in Sailor. The fallback recovers 40 of them, and all 40
+     * were read against the Rust source and were right. Refusing them buys no
+     * truth: the walk has nothing to say there, so the choice is the old answer
+     * or none. The 6 it does not recover are the ones where the walk does reach
+     * a module and the name is simply not found in it, and 5 of those 6 are the
+     * `crate::task` answer above.
+     */
+    const modulePathFiles = (segments: string[]): string[] => {
+      const walked = confine(walkModulePath(homes, segments));
+      if (walked.length > 0) return walked;
+      return matchModulePath(reachable, segments);
+    };
+
+    // A module path, walked segment by segment from the scope it starts in.
+    const byPath = modulePathFiles(rest);
     if (byPath.length > 0) return byPath;
 
     // A type qualifier: the files, within reach, that declare that name. The
@@ -638,7 +777,7 @@ export function resolveCallSites(
     const modulePrefix = rest.slice(0, -1);
     let searchIn: string[];
     if (modulePrefix.length > 0) {
-      searchIn = matchModulePath(reachable, modulePrefix);
+      searchIn = modulePathFiles(modulePrefix);
       if (searchIn.length === 0) return null;
     } else {
       searchIn = [...homes, ...reachable];

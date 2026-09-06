@@ -354,3 +354,132 @@ pub fn go() -> u32 { crate::config::load() }
     ]);
   });
 });
+
+/**
+ * A module path walked one segment at a time, through the real `buildCodeGraph`
+ * pass.
+ *
+ * The layout is the one that tells a walk from a suffix match: `crate::a::b`
+ * and `other::a::b` end in the same two segments, and the caller imports the
+ * second. Matching the whole qualifier against the caller's dependencies picks
+ * the imported one — the path `crate::a::b` does not name it, and the graph
+ * reported it as `unique`.
+ *
+ * Checked against cargo 1.90.0: the fixture compiles, `crate::a::b::f()`
+ * returns 1 (`src/a/b.rs`) and the imported `b::f()` returns 2
+ * (`src/other/a/b.rs`), so the two calls in `caller.rs` are two different
+ * functions and a test that let them share an answer would be describing a
+ * program rustc rejects.
+ */
+describe("Rust multi-hop module paths", () => {
+  let root: string;
+
+  const write = (rel: string, body: string): void => {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, body);
+  };
+
+  async function candidatesOf(
+    callerRel: string,
+    name: string,
+    qualifier: string,
+  ): Promise<string[]> {
+    const graph = await buildCodeGraph(root);
+    resolveCallSites(
+      graph,
+      graph.symbolsByFile,
+      graph.outgoingCallsByFile,
+      graph.rustBindingsByFile,
+      graph.rustCrateRootByFile,
+      graph.rustInlineScopedCalls,
+    );
+    const edge = (graph.outgoingCallsByFile.get(callerRel) ?? []).find(
+      (e) => e.calleeName === name && e.calleeQualifier === qualifier,
+    );
+    expect(edge, `no qualified call to ${qualifier}::${name} in ${callerRel}`).toBeDefined();
+    return (edge?.calleeCandidates ?? []).slice().sort();
+  }
+
+  beforeAll(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-rust-walk-"));
+
+    write("Cargo.toml", '[package]\nname = "sib"\nedition = "2021"\n');
+    write(
+      "src/lib.rs",
+      "pub mod a;\npub mod caller;\npub mod deep;\npub mod leaf;\npub mod other;\npub mod support;\n",
+    );
+    // The module the path names. Nothing in the crate imports `a/b.rs`
+    // directly — `a/mod.rs` declares it — so only a walk reaches it.
+    write("src/a/mod.rs", "pub mod b;\n");
+    write("src/a/b.rs", "pub fn f() -> u32 { 1 }\n");
+    // The homonym: same last two segments, a different module.
+    write("src/other/mod.rs", "pub mod a;\n");
+    write("src/other/a/mod.rs", "pub mod b;\n");
+    write("src/other/a/b.rs", "pub fn f() -> u32 { 2 }\n");
+    write(
+      "src/caller.rs",
+      "use crate::other::a::b;\n\npub fn go() -> u32 {\n    let _ = b::f();\n    crate::a::b::f()\n}\n\npub fn deeper() -> u32 {\n    crate::deep::leaf::g()\n}\n",
+    );
+    // A `crate::` written in an integration test is the test's own crate, and
+    // its modules are filed beside it. The library has a `support` of its own,
+    // which is what reading the test's `crate::` as the library answers with.
+    write("src/support.rs", "pub fn helper() -> u32 { 10 }\n");
+    write("tests/support.rs", "pub fn helper() -> u32 { 20 }\n");
+    write(
+      "tests/t.rs",
+      "mod support;\n\n#[test]\nfn t() {\n    let got = crate::support::helper();\n    assert_eq!(got, 20);\n}\n",
+    );
+    // An ordinary module written as `deep.rs`, whose child is filed under the
+    // directory named after it, and a homonym of that child sitting beside
+    // `deep.rs` itself. A crate root takes its children from its own directory
+    // whatever it is called, so a module mistaken for one answers with the
+    // homonym.
+    write("src/deep.rs", "pub mod leaf;\n");
+    write("src/deep/leaf.rs", "pub fn g() -> u32 { 1 }\n");
+    write("src/leaf.rs", "pub fn g() -> u32 { 2 }\n");
+  });
+
+  afterAll(() => {
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("reaches a sibling module the caller never imports, and not its homonym", async () => {
+    // The regression: `crate::a::b::f()` is `src/a/b.rs`. `src/other/a/b.rs`
+    // is a dependency of the caller and its path ends in `a/b`, which is what
+    // a suffix match answers with — a file this path does not name.
+    expect(await candidatesOf("src/caller.rs", "f", "crate::a::b")).toEqual([
+      "src/a/b.rs::f#1",
+    ]);
+  });
+
+  it("keeps the imported homonym reachable under the name it was bound to", async () => {
+    // The other half of the same fixture: narrowing `crate::a::b` must not
+    // move `b::f()`, which really is the imported `other::a::b`.
+    expect(await candidatesOf("src/caller.rs", "f", "b")).toEqual([
+      "src/other/a/b.rs::f#1",
+    ]);
+  });
+
+  it("files an integration test's modules beside the test, not under its name", async () => {
+    // cargo 1.90.0 runs this fixture's `tests/t.rs` green asserting 20, so
+    // `crate::support` there is `tests/support.rs`. Reading the test as an
+    // ordinary module files its children under `tests/t/` and finds nothing;
+    // reading its `crate::` as the library answers `src/support.rs`.
+    expect(await candidatesOf("tests/t.rs", "helper", "crate::support")).toEqual([
+      "tests/support.rs::helper#1",
+    ]);
+  });
+
+  it("files an ordinary module's children under its own name, not beside it", async () => {
+    // The other side of the same question, and the one a walk needs at every
+    // hop: `src/deep.rs` is not a crate root, so `mod leaf;` written in it is
+    // `src/deep/leaf.rs` and not the `src/leaf.rs` sitting beside it. cargo
+    // 1.98.0 on this fixture returns 1 for `crate::deep::leaf::g()` and 2 for
+    // `crate::leaf::g()`, so answering with the second is a different
+    // function, reported as `unique`.
+    expect(await candidatesOf("src/caller.rs", "g", "crate::deep::leaf")).toEqual([
+      "src/deep/leaf.rs::g#1",
+    ]);
+  });
+});

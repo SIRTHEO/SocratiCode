@@ -1393,3 +1393,200 @@ describe("Rust qualified calls rooted in `super`", () => {
     expect(edge.confidence).toBe("unique");
   });
 });
+
+/**
+ * Walking a module path one segment at a time.
+ *
+ * One crate, rooted at `src/lib.rs`, holding every shape the walk has to tell
+ * apart: a module reached in two hops, a file sitting at the right path that
+ * nothing declares, a segment naming nothing, one module written at both of
+ * its two legal spellings, and a module the file graph reaches without a
+ * `mod` chain to walk.
+ */
+describe("Rust module paths, walked segment by segment", () => {
+  const LIB = "src/lib.rs";
+  const AMOD = "src/a/mod.rs";
+  const AB = "src/a/b.rs";
+  const INNER = "src/a/inner.rs";
+  /** Sits exactly where `crate::a::ghost` would, and nothing declares it. */
+  const GHOST = "src/a/ghost.rs";
+  /** One module, both spellings — which rustc rejects and a graph reports. */
+  const TWIN_FILE = "src/a/twin.rs";
+  const TWIN_DIR = "src/a/twin/mod.rs";
+  /** Reached by the graph, with no `mod` chain from the root to walk down. */
+  const HIDDEN = "src/hidden/thing.rs";
+  /** Another `b`, one level further down, that the parent also imports. */
+  const DEEPER_B = "src/a/other/b.rs";
+  /** A binary: a crate root whose stem says nothing about it being one. */
+  const BIN = "src/bin/x.rs";
+  const BIN_HELPER = "src/bin/helper.rs";
+  /** Same module name, another directory, and the binary imports it. */
+  const DECOY = "src/other/helper.rs";
+
+  function graph(): CodeGraph {
+    const node = (
+      relativePath: string,
+      dependencies: string[],
+      dependents: string[],
+    ): CodeGraph["nodes"][number] => ({
+      relativePath,
+      imports: [],
+      exports: [],
+      dependencies,
+      dependents,
+    });
+    return {
+      nodes: [
+        node(LIB, [AMOD, HIDDEN], []),
+        node(AMOD, [AB, INNER, TWIN_FILE, TWIN_DIR, DEEPER_B], [LIB]),
+        node(AB, [], [AMOD]),
+        node(INNER, [], [AMOD]),
+        node(GHOST, [], []),
+        node(TWIN_FILE, [], [AMOD]),
+        node(TWIN_DIR, [], [AMOD]),
+        node(HIDDEN, [], [LIB]),
+        node(DEEPER_B, [], [AMOD]),
+        node(BIN, [BIN_HELPER, DECOY], []),
+        node(BIN_HELPER, [], [BIN]),
+        node(DECOY, [], [BIN]),
+      ],
+      edges: [],
+    };
+  }
+
+  function sym(file: string, name: string, line: number): SymbolNode {
+    return {
+      id: `${file}::${name}#${line}`,
+      name,
+      qualifiedName: name,
+      kind: "function",
+      file,
+      line,
+      endLine: line,
+      language: "rust",
+    };
+  }
+
+  function symbols(): Map<string, SymbolNode[]> {
+    return new Map<string, SymbolNode[]>([
+      [LIB, [sym(LIB, "caller", 1)]],
+      // `deep` here too: a walk that shrugged off a hop it could not make
+      // would stop at `a` and answer with this one.
+      [AMOD, [sym(AMOD, "deep", 2)]],
+      [AB, [sym(AB, "deep", 3)]],
+      [INNER, [sym(INNER, "inner_caller", 1)]],
+      // A name of its own, so that accepting this file and carrying on past a
+      // dead hop stay two different failures with two different tests.
+      [GHOST, [sym(GHOST, "ghost_fn", 4)]],
+      [TWIN_FILE, [sym(TWIN_FILE, "pick", 5)]],
+      [TWIN_DIR, [sym(TWIN_DIR, "pick", 6)]],
+      [HIDDEN, [sym(HIDDEN, "only_here", 7)]],
+      [DEEPER_B, [sym(DEEPER_B, "deep", 10)]],
+      [BIN, [sym(BIN, "caller", 1)]],
+      [BIN_HELPER, [sym(BIN_HELPER, "help", 8)]],
+      [DECOY, [sym(DECOY, "help", 9)]],
+    ]);
+  }
+
+  /** Every file is in one crate rooted at the project root, as tokio's is. */
+  function crateRoots(): Map<string, string> {
+    const m = new Map<string, string>();
+    for (const f of [
+      LIB, AMOD, AB, INNER, GHOST, TWIN_FILE, TWIN_DIR, HIDDEN, DEEPER_B, BIN, BIN_HELPER,
+      DECOY,
+    ]) {
+      m.set(f, "");
+    }
+    return m;
+  }
+
+  function resolveOne(calleeName: string, qualifier: string, from = LIB): SymbolEdge {
+    const edge: SymbolEdge = {
+      callerId: `${from}::caller#1`,
+      calleeName,
+      calleeCandidates: [],
+      confidence: "unresolved",
+      kind: "call",
+      calleeQualifier: qualifier,
+      callSite: { file: from, line: 2 },
+    };
+    resolveCallSites(
+      graph(),
+      symbols(),
+      new Map([[from, [edge]]]),
+      undefined,
+      crateRoots(),
+    );
+    return edge;
+  }
+
+  it("reaches a module two hops down that nothing imports directly", () => {
+    // Only `a/mod.rs` depends on `a/b.rs`. Matching `a::b` against the
+    // caller's own dependencies never sees it.
+    const edge = resolveOne("deep", "crate::a::b");
+    expect(edge.calleeCandidates).toEqual([`${AB}::deep#3`]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("walks a `super::` path on past the parent it climbs to", () => {
+    // `super::b` from `a/inner.rs` is the parent's `b`, which is one climb
+    // and then one hop — and `inner.rs` never imports `b.rs`. The parent also
+    // imports `a/other/b.rs`, whose path ends in `b` too, so only a hop that
+    // looks where the parent files its own children answers with one file.
+    const edge = resolveOne("deep", "super::b", INNER);
+    expect(edge.calleeCandidates).toEqual([`${AB}::deep#3`]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("refuses a file at the right path that no module declares", () => {
+    // `src/a/ghost.rs` is spelled exactly as `crate::a::ghost` would be, and
+    // carries a `deep`. Nothing declares it, so Rust cannot reach it and the
+    // hop must not either — the file existing is not the module existing.
+    const edge = resolveOne("ghost_fn", "crate::a::ghost");
+    expect(edge.calleeCandidates).toEqual([]);
+    expect(edge.confidence).toBe("unresolved");
+  });
+
+  it("stops at a hop that finds nothing instead of answering from halfway", () => {
+    // `a` resolves and `missing` does not. Carrying on with the frontier the
+    // last good hop left answers `a/mod.rs`'s own `deep` as `unique` — a
+    // function `crate::a::missing::deep()` does not name.
+    const edge = resolveOne("deep", "crate::a::missing");
+    expect(edge.calleeCandidates).toEqual([]);
+    expect(edge.confidence).toBe("unresolved");
+  });
+
+  it("keeps both spellings of one module rather than picking one", () => {
+    // `a/twin.rs` and `a/twin/mod.rs` are the same module written twice, which
+    // rustc rejects (E0761) and a file graph merely reports. Two answers is
+    // the honest reading; choosing either would be a `unique` that half the
+    // trees would find wrong.
+    const edge = resolveOne("pick", "crate::a::twin");
+    expect(edge.calleeCandidates.slice().sort()).toEqual([
+      `${TWIN_FILE}::pick#5`,
+      `${TWIN_DIR}::pick#6`,
+    ]);
+    expect(edge.confidence).toBe("multiple-candidates");
+  });
+
+  it("files a binary's modules beside the binary, and starts `crate::` there", () => {
+    // cargo 1.90.0 on `src/bin/x.rs` writing `mod helper;` answers `file not
+    // found … create file "src/bin/helper.rs"`, so a crate root's children sit
+    // in its own directory whatever its stem is. Reading `x.rs` as an ordinary
+    // module looks under `src/bin/x/`, finds nothing, and falls back to the
+    // suffix — which the imported `src/other/helper.rs` makes ambiguous.
+    const edge = resolveOne("help", "crate::helper", BIN);
+    expect(edge.calleeCandidates).toEqual([`${BIN_HELPER}::help#8`]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("still matches by suffix where there is no `mod` chain to walk", () => {
+    // The root reaches `src/hidden/thing.rs` without declaring a `hidden`
+    // module the walk can step through — which is what a `mod` written inside
+    // a macro, or an inline `mod` block, looks like from the file graph.
+    // Dropping the older match loses the edge and gains no truth.
+    const edge = resolveOne("only_here", "crate::hidden::thing");
+    expect(edge.calleeCandidates).toEqual([`${HIDDEN}::only_here#7`]);
+    expect(edge.confidence).toBe("unique");
+  });
+});
