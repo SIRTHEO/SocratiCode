@@ -39,6 +39,20 @@ const KNOWN_CODE_EXT =
   /\.(?:[jt]sx?|m[jt]s|c[jt]s|py|rb|php|go|rs|java|kt|scala|cs|swift|dart|c|cpp|h|hpp|ex|exs|vue|svelte|lua|sh)$/i;
 
 /**
+ * The directories, relative to a crate's own, where Cargo autodiscovers
+ * targets. Each target is a crate of its own, so `crate::` written inside one
+ * starts at that target's root and never reaches the library.
+ *
+ * Two conventional shapes live in each: a `.rs` file directly inside
+ * (`tests/foo.rs`) is a target, and so is `<name>/main.rs` one level down
+ * (`tests/foo/main.rs`), whose neighbours are that target's modules. Nothing
+ * else is: checked against `cargo metadata` on cargo 1.98, which lists
+ * `tests/dirtest/main.rs` as a target and never lists `tests/common/mod.rs`
+ * or `src/bin/tool/sub/main.rs`.
+ */
+const CARGO_TARGET_DIRS = ["src/bin", "tests", "benches", "examples"];
+
+/**
  * The kinds a Rust path can be qualified by, as this extractor labels them: a
  * `struct` (which also covers `union`), an `enum`, a `trait`, and a `type`
  * (which also covers an associated type). Rust keeps types and values in
@@ -262,24 +276,62 @@ export function resolveCallSites(
   }
 
   /**
-   * The files a `crate::` path starts from: the crate's own root modules.
+   * The files a `crate::` path starts from: the root of the *target* the
+   * caller is compiled into.
    *
-   * The manifests give the crate's directory, and the root module is `lib.rs`
-   * or `main.rs` in it, with or without a `src/`. One directory can hold two
-   * of them, and then it holds two crates: `crate::` written in `main.rs`
-   * means the binary, and answering with the library is a different file, not
-   * a wider one. So a root module is its own `crate::`, a file under
-   * `src/bin/` is a root module of its own, and where a crate has more than
-   * one root the answer is the roots that actually reach the caller — all of
-   * them when the graph cannot tell, which is an honest ambiguity rather than
-   * a guess.
+   * The manifests give the crate's directory, and the library's root module is
+   * `lib.rs` or `main.rs` in it, with or without a `src/`. One directory can
+   * hold two of them, and then it holds two crates: `crate::` written in
+   * `main.rs` means the binary, and answering with the library is a different
+   * file, not a wider one. So a root module is its own `crate::`, and where a
+   * crate has more than one root the answer is the roots that actually reach
+   * the caller.
    *
-   * Empty leaves `crate::` reading the caller's own scope, which is what it
-   * did before the crate map existed.
+   * A package is more than its library, though. Cargo compiles each binary,
+   * integration test, benchmark and example as a separate crate, and none of
+   * them is reachable from the library — a library never imports its own
+   * tests. Left to the fallback below those files got *every* root, which
+   * collapses to `unique` on the library as soon as the library alone declares
+   * the name, and that is the wrong file: checked with rustc, `crate::helper()`
+   * in `tests/foo.rs` is the test's own `helper` and does not compile against
+   * the library's. {@link CARGO_TARGET_DIRS} is where those roots are found by
+   * shape.
+   *
+   * Three answers, and they are not the same:
+   *   - `null` — nothing is known about this file's crate, so `crate::` keeps
+   *     reading the caller's own scope, which is what it did before the crate
+   *     map existed.
+   *   - `[]` — the layout proves the caller is not part of any root that can
+   *     be named here. The edge is left unresolved: a target declared only by
+   *     `[[bin]] path = "…"` is invisible from here, and answering with
+   *     another root names a different crate.
+   *   - a non-empty list — the roots the path starts at.
    */
-  function crateRootFilesOf(callerFile: string): string[] {
+  function crateRootFilesOf(callerFile: string): string[] | null {
     const prefix = rustCrateRootByFile?.get(callerFile);
-    if (prefix === undefined) return [];
+    if (prefix === undefined) return null;
+
+    for (const dir of CARGO_TARGET_DIRS) {
+      const targetDir = `${prefix}${dir}/`;
+      if (!callerFile.startsWith(targetDir)) continue;
+      const rest = callerFile.slice(targetDir.length);
+      const slash = rest.indexOf("/");
+      // `tests/foo.rs`, `src/bin/x.rs`: the file is the whole target, so it is
+      // its own root.
+      if (slash === -1) return [callerFile];
+      // `tests/foo/main.rs` roots the target `foo`, and every other file in
+      // that directory is one of its modules — however deep, because Cargo
+      // autodiscovers the first level only.
+      const mainFile = `${targetDir}${rest.slice(0, slash)}/main.rs`;
+      if (rustCrateRootByFile?.has(mainFile)) return [mainFile];
+      // Without that `main.rs` the directory is no target at all —
+      // `tests/common/mod.rs` is the shared-helper idiom, a module of whichever
+      // tests write `mod common;` — or it is one only because a
+      // `[[bin]] path = "…"` says so, which is not read here. Neither is
+      // provable, and the library is a different crate.
+      return [];
+    }
+
     let roots = rootFilesByCratePrefix.get(prefix);
     if (!roots) {
       roots = ["src/lib.rs", "src/main.rs", "lib.rs", "main.rs"]
@@ -287,14 +339,22 @@ export function resolveCallSites(
         .filter((file) => symbolsByFile.has(file));
       rootFilesByCratePrefix.set(prefix, roots);
     }
-    // Cargo gives every `src/bin/x.rs` a crate of its own, and a root module
-    // is trivially its own root.
-    if (callerFile.startsWith(`${prefix}src/bin/`) || roots.includes(callerFile)) {
-      return [callerFile];
-    }
-    if (roots.length <= 1) return roots;
+    // A root module is trivially its own root.
+    if (roots.includes(callerFile)) return [callerFile];
+    // No root module in sight is the same absence of information as no crate
+    // map, so it keeps the same answer rather than turning into a verdict.
+    if (roots.length === 0) return null;
+    if (roots.length === 1) return roots;
     const reaching = roots.filter((root) => reachedFrom(root).has(callerFile));
-    return reaching.length > 0 ? reaching : roots;
+    if (reaching.length > 0) return reaching;
+    // Nothing reaches the caller. For an ordinary module that is honest
+    // ambiguity and every root stays an answer: a `mod` declared inside a
+    // macro is invisible to the file graph, yet the file really does belong to
+    // one of these roots. A file named `main.rs` is not an ordinary module —
+    // `mod x;` reads `x.rs` or `x/mod.rs`, never `x/main.rs` — so an unreached
+    // one is a `[[bin]] path = "…"` target instead, and the library is not it.
+    if (callerFile.endsWith("/main.rs")) return [];
+    return roots;
   }
 
   /**
@@ -474,14 +534,19 @@ export function resolveCallSites(
       // which only declares `sync`. Both sides are inside the same crate, and
       // the confinement below still applies to both.
       const roots = crateRootFilesOf(callerFile);
-      if (roots.length > 0) {
+      // An empty list is a verdict, not a shrug: the caller sits in a target
+      // whose root cannot be named here, so the edge is left unresolved.
+      // Reading `crate::a::b()` in the caller's own scope instead would answer
+      // out of the caller's own module tree, which is a different namespace.
+      if (roots?.length === 0) return null;
+      if (roots) {
         homes = roots;
         scopeDeps = [
           ...new Set([...roots, ...roots.flatMap((r) => depsByFile.get(r) ?? []), ...deps]),
         ];
       }
       // `crate::helper()` names the root module itself.
-      if (rest.length === 0) return roots.length > 0 ? roots : null;
+      if (rest.length === 0) return roots;
     } else {
       // An imported binding rewrites the head into the path it names, so
       // `use crate::a::Type as Alias` makes `Alias::method()` reach exactly
@@ -493,11 +558,14 @@ export function resolveCallSites(
         // `root::helper()` mean `crate::helper()`, and reading it in the
         // caller's own scope would answer nothing where the plain spelling
         // answers the crate root.
-        let boundRoots: string[] = [];
+        let boundRoots: string[] | null = null;
         if (bound[0] === "crate") {
           inOwnCrate = true;
           boundRoots = crateRootFilesOf(callerFile);
-          if (boundRoots.length > 0) {
+          // `use crate as root;` is the same path under another name, so an
+          // unnameable root leaves it unresolved the same way.
+          if (boundRoots?.length === 0) return null;
+          if (boundRoots) {
             homes = boundRoots;
             scopeDeps = [
               ...new Set([
@@ -526,7 +594,7 @@ export function resolveCallSites(
           const head = bound[0] === "crate" || bound[0] === "self" ? bound.slice(1) : bound;
           rest = [...head, ...segments.slice(1)];
           // `use crate as root;` binds the crate root itself.
-          if (rest.length === 0) return boundRoots.length > 0 ? boundRoots : null;
+          if (rest.length === 0) return boundRoots;
         }
       }
     }

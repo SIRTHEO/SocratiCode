@@ -102,7 +102,14 @@ pub fn go() -> u32 {
     // ── One directory holding a library and a binary, which is two crates ──
     // `crate::` in `main.rs` is the binary's own root, and answering with the
     // library is a different file. Cargo gives `src/bin/x.rs` a crate too.
-    write("tool/Cargo.toml", '[package]\nname = "tool"\nedition = "2021"\n');
+    // The two `[[bin]]` entries are targets no convention would find: one
+    // inside `src/bin/` with no `main.rs` beside it, one outside it entirely.
+    // `cargo metadata` lists both (cargo 1.98), and nothing but the manifest
+    // says so — which is why the resolver leaves them unresolved below.
+    write(
+      "tool/Cargo.toml",
+      '[package]\nname = "tool"\nedition = "2021"\n\n[[bin]]\nname = "custom"\npath = "src/bin/custom/helper.rs"\n\n[[bin]]\nname = "launcher"\npath = "launcher/main.rs"\n',
+    );
     write("tool/src/lib.rs", "pub mod shared;\n\npub fn helper() -> u32 { 10 }\n");
     write("tool/src/shared.rs", "pub fn f() -> u32 { 11 }\n");
     write("tool/src/main.rs", `mod cli;
@@ -121,6 +128,93 @@ fn main() {
     let _ = crate::helper();
 }
 `);
+
+    // ── A multi-file binary: `src/bin/packer/main.rs` roots it, and every
+    // file beside it is one of its modules, however deep. Checked with cargo
+    // 1.98: `crate::helper()` in `packer/nested.rs` is the binary's `helper`,
+    // and with that one removed the build fails with E0425 rather than falling
+    // back to the library's.
+    write("tool/src/bin/packer/main.rs", `mod nested;
+mod sub;
+
+pub fn helper() -> u32 { 14 }
+
+fn main() {
+    let _ = nested::go() + sub::deep::go();
+}
+`);
+    write("tool/src/bin/packer/nested.rs", "pub fn go() -> u32 { crate::helper() }\n");
+    write("tool/src/bin/packer/sub/mod.rs", "pub mod deep;\n");
+    write("tool/src/bin/packer/sub/deep.rs", "pub fn go() -> u32 { crate::helper() }\n");
+
+    // A `src/bin/` directory with no `main.rs`: a target only because the
+    // manifest names the file, which is not readable from the resolver.
+    write("tool/src/bin/custom/helper.rs", `mod thing;
+
+pub fn helper() -> u32 { 21 }
+
+fn main() {
+    let _ = crate::helper();
+    let _ = crate::thing::run();
+}
+`);
+    write("tool/src/bin/custom/thing.rs", "pub fn run() -> u32 { 22 }\n");
+
+    // ── Integration tests, benchmarks and examples: each a crate of its own,
+    // and none of them reachable from the library, which never imports its
+    // own tests.
+    write("tool/tests/it.rs", `pub fn helper() -> u32 { 31 }
+
+#[test]
+fn t() {
+    let _ = crate::helper();
+}
+`);
+    write("tool/tests/dirtest/main.rs", `mod nested;
+
+pub fn helper() -> u32 { 32 }
+
+#[test]
+fn t() {
+    let _ = nested::go();
+}
+`);
+    write("tool/tests/dirtest/nested.rs", "pub fn go() -> u32 { crate::helper() }\n");
+    // The shared-helper idiom: `tests/common/` holds no `main.rs`, so it is no
+    // target, and `crate::` in it means whichever test wrote `mod common;`.
+    write("tool/tests/common/mod.rs", "pub fn shared() -> u32 { crate::helper() }\n");
+    write("tool/benches/b.rs", `pub fn helper() -> u32 { 41 }
+
+fn main() {
+    let _ = crate::helper();
+}
+`);
+    write("tool/examples/e.rs", `pub fn helper() -> u32 { 51 }
+
+fn main() {
+    let _ = crate::helper();
+}
+`);
+    // A `[[bin]] path` outside every conventional directory. No root reaches
+    // it, and it is named `main.rs`, which `mod x;` never resolves to.
+    write("tool/launcher/main.rs", `pub fn helper() -> u32 { 61 }
+
+fn main() {
+    let _ = crate::helper();
+}
+`);
+
+    // ── A crate whose root module sits where no convention looks ──────────
+    // `[lib] path` is not read here, so nothing is known about this crate's
+    // roots — which is the same absence of information as having no crate map
+    // at all, and keeps `crate::` reading the caller's own scope rather than
+    // turning into a verdict of "unresolved".
+    write("odd/Cargo.toml", '[package]\nname = "odd"\nedition = "2021"\n\n[lib]\npath = "core/root.rs"\n');
+    write("odd/core/root.rs", `pub mod config;
+
+pub fn go() -> u32 { crate::config::load() }
+`);
+    write("odd/core/config.rs", "pub fn load() -> u32 { 91 }\n");
 
     write("crates/alpha/inner/beta/Cargo.toml", '[package]\nname = "beta"\nedition = "2021"\n');
     write("crates/alpha/inner/beta/src/lib.rs", "pub mod config;\n");
@@ -169,6 +263,89 @@ fn main() {
     expect(await candidatesOf("tool/src/cli.rs", "helper", "crate")).toEqual([
       "tool/src/main.rs::helper#3",
     ]);
+  });
+
+  it("reads `crate::` in a binary's nested module as that binary's `main.rs`", async () => {
+    // `src/bin/packer/nested.rs` is a module of the `packer` binary, not a
+    // crate root of its own. Three files declare `helper` here: the library,
+    // the `src/main.rs` binary, and `packer/main.rs` — and only the last one
+    // is what rustc reads.
+    expect(await candidatesOf("tool/src/bin/packer/nested.rs", "helper", "crate")).toEqual([
+      "tool/src/bin/packer/main.rs::helper#4",
+    ]);
+  });
+
+  it("maps a file nested deeper under a binary to the same `main.rs`", async () => {
+    // Cargo autodiscovers `src/bin/<name>/main.rs` and nothing below it, so
+    // `packer/sub/deep.rs` belongs to `packer`, not to a `sub` of its own.
+    expect(await candidatesOf("tool/src/bin/packer/sub/deep.rs", "helper", "crate")).toEqual([
+      "tool/src/bin/packer/main.rs::helper#4",
+    ]);
+  });
+
+  it("reads `crate::` in an integration test as the test's own root", async () => {
+    // A library never imports its own tests, so no root reaches `tests/it.rs`
+    // and every root used to be the answer — which collapses onto the library
+    // as soon as the library alone declares the name.
+    expect(await candidatesOf("tool/tests/it.rs", "helper", "crate")).toEqual([
+      "tool/tests/it.rs::helper#1",
+    ]);
+  });
+
+  it("reads `crate::` in a benchmark as the benchmark's own root", async () => {
+    expect(await candidatesOf("tool/benches/b.rs", "helper", "crate")).toEqual([
+      "tool/benches/b.rs::helper#1",
+    ]);
+  });
+
+  it("reads `crate::` in an example as the example's own root", async () => {
+    expect(await candidatesOf("tool/examples/e.rs", "helper", "crate")).toEqual([
+      "tool/examples/e.rs::helper#1",
+    ]);
+  });
+
+  it("reads a folder test's module as that test's `main.rs`", async () => {
+    expect(await candidatesOf("tool/tests/dirtest/nested.rs", "helper", "crate")).toEqual([
+      "tool/tests/dirtest/main.rs::helper#3",
+    ]);
+  });
+
+  it("leaves a `src/bin` directory with no `main.rs` unresolved", async () => {
+    // `[[bin]] path = "src/bin/custom/helper.rs"` is the only thing that makes
+    // this file a target, and the manifest is not read here. The library and
+    // the `src/main.rs` binary both declare `helper`, and neither is it.
+    expect(await candidatesOf("tool/src/bin/custom/helper.rs", "helper", "crate")).toEqual([]);
+  });
+
+  it("does not read an unprovable target's `crate::` in its own scope", async () => {
+    // `crate::thing::run()` would find `custom/thing.rs` through the caller's
+    // own dependencies. Right answer, wrong reason: whether the crate root is
+    // `helper.rs` is exactly what cannot be established here, so the honest
+    // answer is none.
+    expect(await candidatesOf("tool/src/bin/custom/helper.rs", "run", "crate::thing")).toEqual([]);
+  });
+
+  it("leaves a shared `tests/common/mod.rs` unresolved", async () => {
+    // No `main.rs` beside it, so `tests/common/` is no target: this file is a
+    // module of whichever integration tests write `mod common;`, and `crate::`
+    // in it means a different root for each of them.
+    expect(await candidatesOf("tool/tests/common/mod.rs", "helper", "crate")).toEqual([]);
+  });
+
+  it("leaves a `main.rs` no root reaches unresolved", async () => {
+    // `launcher/main.rs` is a `[[bin]] path` target outside every conventional
+    // directory. `mod x;` reads `x.rs` or `x/mod.rs` and never `x/main.rs`, so
+    // this is no module of the library either — answering with every root
+    // would name the library, which is a different crate.
+    expect(await candidatesOf("tool/launcher/main.rs", "helper", "crate")).toEqual([]);
+  });
+
+  it("keeps reading `crate::` in its own scope when a crate shows no root", async () => {
+    // Knowing nothing is not the same verdict as knowing the caller is out of
+    // reach: the empty answer above leaves an edge unresolved, and this one
+    // must not, or a crate laid out by `[lib] path` would lose every
+    // `crate::` edge it has.
+    expect(await candidatesOf("odd/core/root.rs")).toEqual(["odd/core/config.rs::load#1"]);
   });
 
   it("keeps a crate's `crate::` out of a crate nested inside its own directory", async () => {
