@@ -61,6 +61,16 @@ export interface ExtractedSymbols {
   }>;
   /** Rust `use` bindings declared by this file. Absent for every other language. */
   bindings?: RustUseBinding[];
+  /**
+   * The ids of the symbols this file declares *inside* an inline `mod` — the
+   * ones a path anchored at the file's own module cannot reach. Set only for
+   * Rust, and only for the files that have any.
+   *
+   * In memory only, like `qualifierRootedInInlineMod`: it reaches resolution
+   * beside the symbols and is never a field on one, so nothing about it is
+   * persisted and a graph built before this still reads.
+   */
+  inlineModSymbolIds?: string[];
 }
 
 /** Build a stable SymbolNode.id. */
@@ -1842,6 +1852,19 @@ function extractCalleeInfoRust(fn: any): { name: string; qualifier?: string } | 
 }
 
 /**
+ * How many inline `mod`s a node is written inside. Zero means the file's own
+ * module, which is the one resolution can name.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function rustInlineModDepth(node: any): number {
+  let depth = 0;
+  for (let p = node.parent(); p; p = p.parent()) {
+    if (p.kind() === "mod_item") depth += 1;
+  }
+  return depth;
+}
+
+/**
  * A qualifier rewritten as the file itself would have written it.
  *
  * `super` counts modules, not files, and an inline `mod` is a module: inside
@@ -1863,6 +1886,15 @@ function extractCalleeInfoRust(fn: any): { name: string; qualifier?: string } | 
  * The qualifier then comes back as it was written, for a reader, and
  * resolution refuses it rather than answering out of a scope that is not the
  * one the path names.
+ *
+ * A `self::` path written inside an inline `mod` is rooted the same way and is
+ * refused the same way. `self` is the module the path is written in, so inside
+ * `mod tests { … }` it is `tests` — checked against rustc, where
+ * `self::helper()` beside a `mod tests`-level `helper` calls that one and not
+ * the file's. `tests` has no file, so this is the same refusal, not a new one.
+ * Lowercase only: `Self::` is the implementing type, not a module, and
+ * `Self::poll()` inside a `#[cfg(test)] mod tests` is a call this still
+ * answers.
  */
 function rustQualifierFromFile(
   // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
@@ -1871,13 +1903,11 @@ function rustQualifierFromFile(
 ): { qualifier: string; rootedInInlineMod: boolean } {
   const asWritten = { qualifier, rootedInInlineMod: false };
   const segments = qualifier.split("::");
-  if (segments[0] !== "super") return asWritten;
+  if (segments[0] !== "super" && segments[0] !== "self") return asWritten;
 
-  let inlineMods = 0;
-  for (let p = node.parent(); p; p = p.parent()) {
-    if (p.kind() === "mod_item") inlineMods += 1;
-  }
+  const inlineMods = rustInlineModDepth(node);
   if (inlineMods === 0) return asWritten;
+  if (segments[0] === "self") return { qualifier, rootedInInlineMod: true };
 
   let consumed = 0;
   while (consumed < inlineMods && segments[consumed] === "super") consumed += 1;
@@ -1966,6 +1996,11 @@ function extractFromRust(
   // the end of this function.
   const declared: Array<{ sym: SymbolNode; offset: number }> = [];
   const bindings: RustUseBinding[] = [];
+  // The declarations that sit inside an inline `mod`. Collected here because
+  // this is the only place the nesting is still visible: by the time
+  // resolution has the symbols, an inline module has left no trace on them.
+  // Ids, not nodes, because that is what a candidate list holds.
+  const inlineModSymbolIds: string[] = [];
 
   for (const fn of safeFindAll(root, "function_item")) {
     const nameNode = safeFind(fn, "identifier");
@@ -1979,6 +2014,7 @@ function extractFromRust(
       name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
     };
     declared.push({ sym, offset: r.start.index });
+    if (rustInlineModDepth(fn) > 0) inlineModSymbolIds.push(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
@@ -2059,9 +2095,10 @@ function extractFromRust(
     const name = nameNode.text();
     const r = item.range();
     const startLine = r.start.line + 1;
+    const id = makeId(file, name, startLine);
     declared.push({
       sym: {
-        id: makeId(file, name, startLine),
+        id,
         name,
         qualifiedName: name,
         kind: symbolKind,
@@ -2072,6 +2109,7 @@ function extractFromRust(
       },
       offset: r.start.index,
     });
+    if (rustInlineModDepth(item) > 0) inlineModSymbolIds.push(id);
   }
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
@@ -2123,7 +2161,7 @@ function extractFromRust(
   declared.sort((a, b) => a.offset - b.offset);
   const symbols: SymbolNode[] = [moduleSym, ...declared.map((d) => d.sym)];
 
-  return { symbols, rawCalls, bindings };
+  return { symbols, rawCalls, bindings, inlineModSymbolIds };
 }
 
 // ── JVM (Java / Kotlin / Scala) ──────────────────────────────────────────

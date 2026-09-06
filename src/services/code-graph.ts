@@ -254,6 +254,7 @@ async function doRebuildGraph(
           built.rustBindingsByFile,
           built.rustCrateRootByFile,
           built.rustInlineScopedCalls,
+          built.rustInlineDeclaredSymbols,
         );
 
         progress.phase = "persisting symbols";
@@ -823,6 +824,12 @@ export async function buildCodeGraph(
    * nothing about it reaches an edge or the store.
    */
   rustInlineScopedCalls: Set<SymbolEdge>;
+  /**
+   * The ids of the Rust symbols declared inside an inline `mod`. A path
+   * anchored at a file's own module cannot reach them, so resolution drops
+   * them from that path's candidates. Resolution input only, never persisted.
+   */
+  rustInlineDeclaredSymbols: Set<string>;
 }> {
   ensureDynamicLanguages();
 
@@ -847,6 +854,7 @@ export async function buildCodeGraph(
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
   const rustBindingsByFile = new Map<string, RustUseBinding[]>();
   const rustInlineScopedCalls = new Set<SymbolEdge>();
+  const rustInlineDeclaredSymbols = new Set<string>();
 
   // Per-reason counts, holding only the reasons that actually fired — the build log
   // emits `skipReasons` straight from this map, so it never carries a zero.
@@ -1096,6 +1104,11 @@ export async function buildCodeGraph(
       for (let i = 0; i < extracted.rawCalls.length; i++) {
         if (extracted.rawCalls[i].qualifierRootedInInlineMod) rustInlineScopedCalls.add(edges[i]);
       }
+      // Same reason, one level down: which declarations sit inside an inline
+      // `mod` is visible in the extractor and nowhere after it.
+      if (extracted.inlineModSymbolIds) {
+        for (const id of extracted.inlineModSymbolIds) rustInlineDeclaredSymbols.add(id);
+      }
       if (extracted.bindings && extracted.bindings.length > 0) {
         rustBindingsByFile.set(relPath, extracted.bindings);
       }
@@ -1195,5 +1208,6 @@ export async function buildCodeGraph(
     rustBindingsByFile,
     rustCrateRootByFile,
     rustInlineScopedCalls,
+    rustInlineDeclaredSymbols,
   };
 }

@@ -173,6 +173,17 @@ export function resolveCallSites(
    * one of those is not something Rust can reach from the other.
    */
   rustInlineScopedCalls?: Set<SymbolEdge>,
+  /**
+   * The ids of the Rust symbols declared inside an inline `mod`. A `self`
+   * qualifier names the file's own module, and from there Rust reaches what
+   * the file declares at its top level and nothing an inline `mod` encloses —
+   * so these are dropped from a `self` path's candidates, and the call is
+   * refused when dropping them leaves none.
+   *
+   * Absent for every other language, and absent when a caller does not have
+   * it: nothing is dropped then, which is what this did before.
+   */
+  rustInlineDeclaredSymbols?: Set<string>,
 ): void {
   // Build a fast lookup: file → Map<symbolName, SymbolNode[]>
   const symbolIndexByFile = new Map<string, Map<string, SymbolNode[]>>();
@@ -672,7 +683,29 @@ export function resolveCallSites(
         if (scope) {
           for (const file of scope) candidates.push(...findSymbolsInTarget(file, edge.calleeName));
         }
-        const uniq = Array.from(new Set(candidates));
+        let uniq = Array.from(new Set(candidates));
+        // `self` is the file's own module, and by the time a qualifier reads
+        // `self` that is provably what it names: the extractor rewrites
+        // `super::helper()` to it only after every inline `mod` the call sits
+        // in has been climbed out of, and refuses a `self::` written inside
+        // one rather than rewriting it.
+        //
+        // From that module Rust reaches the file's top-level declarations, and
+        // not a `helper` an inline `mod` encloses — checked against rustc,
+        // which answers E0425 for `super::helper()` when the only `helper` in
+        // the file is declared inside a sibling inline `mod`. The scope is the
+        // file, so those ids come back with the rest; dropping them is what
+        // keeps `unique` and `local` from naming a symbol that is not callable
+        // from where the call is written, and whoever walks the candidates
+        // from following it.
+        //
+        // The refusal already in place for a path rooted in an inline `mod`
+        // then extends to this one: when nothing survives, the edge keeps its
+        // qualifier and goes unresolved, because the file's top level is the
+        // only scope the path names and it declares nothing of that name.
+        if (edge.calleeQualifier === "self" && rustInlineDeclaredSymbols) {
+          uniq = uniq.filter((id) => !rustInlineDeclaredSymbols.has(id));
+        }
         edge.calleeCandidates = uniq;
         if (uniq.length === 0) edge.confidence = "unresolved";
         // `self::helper()` lands in the caller's own file, which is what
