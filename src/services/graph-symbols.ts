@@ -1973,8 +1973,21 @@ function collectRustUseBindings(decl: any, bindings: RustUseBinding[]): void {
         if (last) bindings.push({ local: last, path: prefix });
         return;
       }
+      case "use_wildcard": {
+        // `use imp::*;` binds names this cannot enumerate — the module it
+        // reads from need not even be a file. It is recorded under `*` all the
+        // same, because "some name arrives at this file's top level from that
+        // module" is exactly what separates "the top level cannot reach that
+        // symbol" from "it might, and nothing here can tell". tokio's
+        // `runtime/scheduler/multi_thread/counters.rs` re-exports an inline
+        // `mod` this way, and 34 calls depend on it.
+        const text = node.text();
+        const from = text.endsWith("::*") ? text.slice(0, -3) : "";
+        bindings.push({ local: "*", path: join(prefix, from) });
+        return;
+      }
       default:
-        // `use`, `;`, `{`, `}`, `,`, a visibility modifier, `use_wildcard`.
+        // `use`, `;`, `{`, `}`, `,`, a visibility modifier.
         return;
     }
   };

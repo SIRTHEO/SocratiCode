@@ -350,7 +350,10 @@ export function resolveCallSites(
    * guarantee: the answer is a module the path really reaches, or the edge
    * stays unresolved with its qualifier.
    *
-   * Every hop moves strictly deeper into the tree, so the walk cannot cycle.
+   * The walk is bounded by the number of segments, not by depth: a hop out of
+   * a crate root stays in the same directory (`src/lib.rs` declares
+   * `src/a.rs`), so "each hop goes deeper" is not what stops it. The loop runs
+   * once per segment and ends.
    */
   function walkModulePath(homes: string[], segments: string[]): string[] {
     if (segments.length === 0) return [];
@@ -826,6 +829,32 @@ export function resolveCallSites(
     return null;
   }
 
+  /**
+   * Whether the top level of the file declaring `id` brings `name` up to
+   * itself with a `use`.
+   *
+   * From a file's own module Rust reaches what the file declares at its top
+   * level *and what the top level imports* — a name a `use` carries there is
+   * as reachable as one written there. `counters.rs` in tokio declares
+   * `inc_num_inc_notify_local()` inside `mod imp` and then writes
+   * `pub(super) use imp::*;`, so `super::counters::inc_num_inc_notify_local()`
+   * compiles; `ucred.rs` does the same with seven explicit
+   * `pub(crate) use self::impl_<os>::get_peer_cred;`. Refusing those on the
+   * grounds that the symbol sits inside an inline `mod` withdrew 35 answers
+   * that were right.
+   *
+   * A glob is recorded under `*` because its names cannot be enumerated here.
+   * It is read as "this might be reachable", which keeps the refusal to the
+   * case that is provably out of reach.
+   */
+  function reExportedToTopLevel(id: string, name: string): boolean {
+    const file = fileOfSymbolId.get(id);
+    if (!file) return false;
+    const declared = rustBindingsByFile?.get(file);
+    if (!declared) return false;
+    return declared.some((b) => b.local === name || b.local === "*");
+  }
+
   for (const [callerFile, edges] of outgoingCallsByFile.entries()) {
     const localIdx = symbolIndexByFile.get(callerFile);
     const deps = depsByFile.get(callerFile) ?? [];
@@ -874,7 +903,9 @@ export function resolveCallSites(
         // qualifier and goes unresolved, because the module the path names
         // declares nothing of that name.
         if (scope?.viaModulePath && rustInlineDeclaredSymbols) {
-          uniq = uniq.filter((id) => !rustInlineDeclaredSymbols.has(id));
+          uniq = uniq.filter(
+            (id) => !rustInlineDeclaredSymbols.has(id) || reExportedToTopLevel(id, edge.calleeName),
+          );
         }
         edge.calleeCandidates = uniq;
         if (uniq.length === 0) edge.confidence = "unresolved";

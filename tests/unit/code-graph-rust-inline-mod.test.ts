@@ -48,10 +48,32 @@ describe("Rust `super::` written inside an inline mod", () => {
       `pub mod a;
 pub mod sub;
 pub mod tipo;
+pub mod riesporta;
+pub mod glob;
 
 pub fn from_root() -> u32 { crate::a::c::only_inside() }
+pub fn by_name() -> u32 { crate::riesporta::per_nome() }
+pub fn by_glob() -> u32 { crate::glob::only_via_glob() }
 `,
     );
+    // The two ways a file lifts a name out of its own inline `mod` to its top
+    // level. From the file's module Rust reaches both — cargo 1.98 runs a
+    // crate of this shape green — so refusing them because the symbol sits
+    // inside an inline `mod` withdraws answers that are right. tokio does the
+    // explicit form in `net/unix/ucred.rs` and the glob in
+    // `runtime/scheduler/multi_thread/counters.rs`, 35 calls between them.
+    write("src/riesporta.rs", `mod imp {
+    pub fn per_nome() -> u32 { 22 }
+}
+
+pub(crate) use self::imp::per_nome;
+`);
+    write("src/glob.rs", `mod imp {
+    pub fn only_via_glob() -> u32 { 31 }
+}
+
+pub use imp::*;
+`);
     // The same reach written as `super::`, from a sibling of `c`. Same module,
     // same refusal — the spelling of the path is not what decides it.
     write("src/tipo.rs", `pub fn from_sibling() -> u32 { super::a::c::only_inside() }
@@ -381,5 +403,27 @@ mod tests {
     const edge = edgeFor("reaches_its_own_inline_type", "Local", "make");
     expect(edge.calleeCandidates).toEqual(["src/tipo.rs::make#8"]);
     expect(edge.confidence).toBe("local");
+  });
+
+  it("keeps a name an inline mod re-exports by name to the file's top level", () => {
+    // From a file's own module Rust reaches what the top level declares *and
+    // what it imports*: `pub(crate) use self::imp::per_nome;` puts `per_nome`
+    // there as surely as writing it there. cargo 1.98 runs the assertion
+    // green. Refusing it on the grounds that the declaration sits inside
+    // `mod imp` withdrew 1 right answer in tokio's `net/unix/ucred.rs`.
+    const edge = edgeFor("by_name", "crate::riesporta", "per_nome");
+    expect(edge.calleeCandidates).toEqual(["src/riesporta.rs::per_nome#2"]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("keeps one the file re-exports with a glob, which cannot be enumerated", () => {
+    // `pub use imp::*;` carries names this cannot list — the module it reads
+    // from need not be a file — so the glob is recorded under `*` and read as
+    // "this might be reachable". That keeps the refusal to what is provably
+    // out of reach, and it is what tokio's `counters.rs` needs: 34 calls to
+    // `super::counters::inc_num_inc_notify_local()` and its neighbours.
+    const edge = edgeFor("by_glob", "crate::glob", "only_via_glob");
+    expect(edge.calleeCandidates).toEqual(["src/glob.rs::only_via_glob#2"]);
+    expect(edge.confidence).toBe("unique");
   });
 });
