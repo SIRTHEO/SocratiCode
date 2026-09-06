@@ -872,8 +872,25 @@ describe("Rust qualified calls", () => {
   function rustSymbols(): Map<string, SymbolNode[]> {
     return new Map<string, SymbolNode[]>([
       [LIB, [sym(LIB, "caller", 1, "function"), sym(LIB, "helper", 20, "function")]],
-      [A, [sym(A, "Type", 1, "struct"), sym(A, "method", 5, "function"), sym(A, "run", 9, "function")]],
-      [B, [sym(B, "Type", 1, "struct"), sym(B, "method", 5, "function")]],
+      [
+        A,
+        [
+          sym(A, "Type", 1, "struct"),
+          sym(A, "method", 5, "function"),
+          sym(A, "run", 9, "function"),
+          sym(A, "Config", 12, "struct"),
+        ],
+      ],
+      // `Config` here is a const, not a type: it shares the spelling and
+      // nothing else, and Rust cannot write `Config::method()` against it.
+      [
+        B,
+        [
+          sym(B, "Type", 1, "struct"),
+          sym(B, "method", 5, "function"),
+          sym(B, "Config", 8, "variable"),
+        ],
+      ],
       [DEEP, [sym(DEEP, "shared", 3, "function")]],
       [INNER, [sym(INNER, "inner_caller", 1, "function")]],
     ]);
@@ -944,6 +961,16 @@ describe("Rust qualified calls", () => {
     });
     expect(edge.confidence).toBe("unique");
     expect(edge.calleeCandidates).toEqual([`${A}::method#5`]);
+  });
+
+  it("reads a type qualifier in the type namespace only", () => {
+    // `a.rs` declares `struct Config`; `b.rs` declares a const of the same
+    // name, and a `method` of its own. Counting the const puts `b.rs` in scope
+    // and answers with that `method` too — a file Rust cannot reach through
+    // `Config::`, since a name is a type or a value and never both.
+    const edge = resolveOne("method", "Config");
+    expect(edge.calleeCandidates).toEqual([`${A}::method#5`]);
+    expect(edge.confidence).toBe("unique");
   });
 
   it("keeps an external path unresolved, with its qualifier", () => {

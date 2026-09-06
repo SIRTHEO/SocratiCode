@@ -38,6 +38,14 @@ function normalizePath(p: string): string {
 const KNOWN_CODE_EXT =
   /\.(?:[jt]sx?|m[jt]s|c[jt]s|py|rb|php|go|rs|java|kt|scala|cs|swift|dart|c|cpp|h|hpp|ex|exs|vue|svelte|lua|sh)$/i;
 
+/**
+ * The kinds a Rust path can be qualified by, as this extractor labels them: a
+ * `struct` (which also covers `union`), an `enum`, a `trait`, and a `type`
+ * (which also covers an associated type). Rust keeps types and values in
+ * separate namespaces, and only the first can stand before a `::`.
+ */
+const RUST_TYPE_NAMESPACE = new Set(["struct", "enum", "trait", "type"]);
+
 function stripKnownExt(p: string): string {
   const lastSlash = p.lastIndexOf("/");
   const dir = lastSlash >= 0 ? p.slice(0, lastSlash + 1) : "";
@@ -158,10 +166,16 @@ export function resolveCallSites(
   // `Foo` declared?" into a scope of files, without taking the file apart from
   // the id string.
   const fileOfSymbolId = new Map<string, string>();
+  // symbol id → what it declares. A Rust type qualifier is answered by the
+  // file that declares that *type*, and a name lives in one namespace or the
+  // other: `const Config` cannot qualify `Config::run()`, so the file that
+  // declares it is not an answer.
+  const kindOfSymbolId = new Map<string, SymbolNode["kind"]>();
   for (const [file, syms] of symbolsByFile.entries()) {
     const idx = new Map<string, SymbolNode[]>();
     for (const s of syms) {
       fileOfSymbolId.set(s.id, file);
+      kindOfSymbolId.set(s.id, s.kind);
       if (s.name === "<module>") continue;
       const existing = idx.get(s.name);
       if (existing) existing.push(s);
@@ -448,9 +462,14 @@ export function resolveCallSites(
       searchIn = [...homes, ...reachable];
     }
 
+    // Only what Rust can put before a `::`. A name is in the type namespace or
+    // in the value one, never both, so a `const Config` or a `fn Config` in
+    // reach says nothing about `Config::run()` — counting it would put its file
+    // in scope and answer with whatever `run` that file happens to declare.
     const declaring = new Set<string>();
     for (const file of searchIn) {
       for (const id of findSymbolsInTarget(file, typeName)) {
+        if (!RUST_TYPE_NAMESPACE.has(kindOfSymbolId.get(id) ?? "")) continue;
         const declaredIn = fileOfSymbolId.get(id);
         if (declaredIn) declaring.add(declaredIn);
       }
