@@ -412,14 +412,22 @@ describe("Rust multi-hop module paths", () => {
     // The module the path names. Nothing in the crate imports `a/b.rs`
     // directly — `a/mod.rs` declares it — so only a walk reaches it.
     write("src/a/mod.rs", "pub mod b;\n");
-    write("src/a/b.rs", "pub fn f() -> u32 { 1 }\n");
+    // A type by the same name lives in both, so the module prefix of a type
+    // qualifier is what decides which one — and it is walked, not suffixed.
+    write(
+      "src/a/b.rs",
+      "pub fn f() -> u32 { 1 }\n\npub struct Tipo;\n\nimpl Tipo {\n    pub fn metodo() -> u32 { 41 }\n}\n",
+    );
     // The homonym: same last two segments, a different module.
     write("src/other/mod.rs", "pub mod a;\n");
     write("src/other/a/mod.rs", "pub mod b;\n");
-    write("src/other/a/b.rs", "pub fn f() -> u32 { 2 }\n");
+    write(
+      "src/other/a/b.rs",
+      "pub fn f() -> u32 { 2 }\n\npub struct Tipo;\n\nimpl Tipo {\n    pub fn metodo() -> u32 { 42 }\n}\n",
+    );
     write(
       "src/caller.rs",
-      "use crate::other::a::b;\n\npub fn go() -> u32 {\n    let _ = b::f();\n    crate::a::b::f()\n}\n\npub fn deeper() -> u32 {\n    crate::deep::leaf::g()\n}\n",
+      "use crate::other::a::b;\n\npub fn go() -> u32 {\n    let _ = b::f();\n    crate::a::b::f()\n}\n\npub fn deeper() -> u32 {\n    crate::deep::leaf::g()\n}\n\npub fn by_path() -> u32 {\n    crate::a::b::Tipo::metodo()\n}\n",
     );
     // A `crate::` written in an integration test is the test's own crate, and
     // its modules are filed beside it. The library has a `support` of its own,
@@ -480,6 +488,18 @@ describe("Rust multi-hop module paths", () => {
     // function, reported as `unique`.
     expect(await candidatesOf("src/caller.rs", "g", "crate::deep::leaf")).toEqual([
       "src/deep/leaf.rs::g#1",
+    ]);
+  });
+
+  it("walks the module prefix of a type qualifier too, not just a plain path", async () => {
+    // The other half of the walk, and the one that had no test: the prefix of
+    // `crate::a::b::Tipo::metodo()` says *which* `Tipo`. Matched by suffix, it
+    // reaches `src/other/a/b.rs` as well — the caller imports that file and
+    // its path ends in `a/b` — and the answer becomes two types Rust never
+    // confuses. cargo 1.98 on this fixture: the path form returns 41 and the
+    // imported form returns 42, two different functions.
+    expect(await candidatesOf("src/caller.rs", "metodo", "crate::a::b::Tipo")).toEqual([
+      "src/a/b.rs::metodo#6",
     ]);
   });
 });
