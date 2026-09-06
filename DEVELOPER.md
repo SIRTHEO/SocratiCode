@@ -1616,7 +1616,7 @@ publishes matching integration metadata.
   registered MCP server. The extension is a thin distribution and UI
   shell.
 - It does **not** ship its own copy of the engine. The engine launches
-  via `npx -y socraticode` (configurable via the `socraticode.command` /
+  via `npx -y --prefer-online socraticode@latest` (configurable via the `socraticode.command` /
   `socraticode.args` settings).
 - It does **not** add language-server features (code lenses, hovers,
   diagnostics). Those would conflict with the host editor's existing
