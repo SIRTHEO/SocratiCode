@@ -8,6 +8,29 @@ const esmRequire = createRequire(import.meta.url);
 const pkg = esmRequire("../package.json") as { version: string };
 export const SOCRATICODE_VERSION: string = pkg.version;
 
+// ── Indexing lifecycle configuration ───────────────────────────────────
+
+/** File-watcher policy for this MCP process. */
+export type WatcherMode = "auto" | "manual" | "off";
+
+/**
+ * Resolve SOCRATICODE_WATCHER at call time.
+ *
+ * Reading lazily keeps test and embedded-host configuration predictable while
+ * the startup entry point still validates the value before accepting tools.
+ * Unknown values fail loudly: silently restoring automatic writes would break
+ * the user's deliberate snapshot guarantee.
+ */
+export function getWatcherMode(): WatcherMode {
+  const raw = process.env.SOCRATICODE_WATCHER?.trim().toLowerCase() ?? "";
+  if (raw === "" || raw === "auto") return "auto";
+  if (raw === "manual" || raw === "off") return raw;
+  throw new Error(
+    `Invalid SOCRATICODE_WATCHER: "${process.env.SOCRATICODE_WATCHER}". ` +
+    'Must be "auto", "manual", or "off".',
+  );
+}
+
 // ── Embedding configuration ──────────────────────────────────────────────
 // Embedding model and dimensions are now configured via environment variables.
 // See src/services/embedding-config.ts for OLLAMA_MODE, OLLAMA_URL,
@@ -302,6 +325,10 @@ export const SUPPORTED_EXTENSIONS = new Set([
   ".r", ".R",
   // Dockerfile
   ".dockerfile",
+  // GDScript (Godot)
+  ".gd",
+  // Godot resources (text-based scene/resource files)
+  ".tscn", ".tres",
 ]);
 
 // ── Extra extensions (user-configurable) ─────────────────────────────────
@@ -347,7 +374,6 @@ export const SPECIAL_FILES = new Set([
   ".dockerignore",
 ]);
 
-/** Map file extension to human-readable language name */
 /** Canonical file-extension → language-label map. */
 const EXTENSION_TO_LANGUAGE: Record<string, string> = {
   ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
@@ -375,6 +401,8 @@ const EXTENSION_TO_LANGUAGE: Record<string, string> = {
   ".lua": "lua",
   ".r": "r", ".R": "r",
   ".dockerfile": "dockerfile",
+  ".gd": "gdscript",
+  ".tscn": "godot-resource", ".tres": "godot-resource",
 };
 
 /**
@@ -410,6 +438,8 @@ const LANGUAGE_TO_CANONICAL_EXT: Record<string, string> = {
   css: ".css", scss: ".scss", sass: ".sass", less: ".less", stylus: ".styl",
   vue: ".vue",
   svelte: ".svelte",
+  gdscript: ".gd",
+  "godot-resource": ".tscn",
 };
 
 /**

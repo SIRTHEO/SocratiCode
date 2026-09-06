@@ -199,6 +199,33 @@ describe("code-index effective profile compatibility", () => {
     });
   });
 
+  it("adds newly supported Godot files to an existing index without re-indexing unchanged files", async () => {
+    const indexer = await loadIndexer();
+    const { legacyIndexProfile } = await import("../../src/services/index-profile.js");
+    const unchangedContent = "existing source";
+    const project = await createProject("notes.txt", unchangedContent);
+    await fsp.writeFile(path.join(project, "player.gd"), "extends Node\n");
+    await fsp.writeFile(path.join(project, "level.tscn"), "[gd_scene format=3]\n");
+    await fsp.writeFile(path.join(project, "material.tres"), "[gd_resource format=3]\n");
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedProfile = legacyIndexProfile("code");
+    storedProfile.extensionLanguageMap = {};
+    storedHashes = new Map([["notes.txt", indexer.hashContent(unchangedContent)]]);
+
+    const result = await indexer.updateProjectIndex(project);
+
+    expect(result).toMatchObject({ added: 3, updated: 0, removed: 0 });
+    expect(deletedFiles).toEqual([]);
+    const finalHashes = savedMetadata.at(-1)?.hashes;
+    expect(finalHashes?.size).toBe(4);
+    expect([...(finalHashes?.keys() ?? [])].sort()).toEqual([
+      "level.tscn",
+      "material.tres",
+      "notes.txt",
+      "player.gd",
+    ]);
+  });
+
   it("replaces a changed legacy file with the legacy document representation", async () => {
     const indexer = await loadIndexer();
     const content = "changed source content that is deliberately longer than twenty characters";

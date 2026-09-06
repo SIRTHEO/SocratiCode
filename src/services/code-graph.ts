@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Lang, registerDynamicLanguage } from "@ast-grep/napi";
 import { graphCollectionName, projectIdFromPath } from "../config.js";
 import { ELIXIR_TEMPLATE_EXTENSIONS, EXTENSION_LANGUAGE_MAP, EXTRA_EXTENSIONS, getLanguageFromExtension, MAX_GRAPH_FILE_BYTES, toForwardSlash } from "../constants.js";
@@ -16,7 +18,7 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotRootForFile, type GodotUidIndex, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import {
   extractSymbolsAndCalls,
@@ -146,26 +148,30 @@ export async function getOrBuildGraph(
   projectPath: string,
   extraExtensions?: Set<string>,
 ): Promise<CodeGraph> {
+  const existing = await getExistingGraph(projectPath);
+  if (existing) return existing;
+
   const resolved = path.resolve(projectPath);
-  const cached = graphCache.get(resolved);
-  if (cached) {
-    return cached;
-  }
-
-  // Try loading persisted graph from Qdrant
-  const projectId = projectIdFromPath(resolved);
-  const graphCollName = graphCollectionName(projectId);
-  const persisted = await loadGraphData(graphCollName);
-  if (persisted) {
-    graphCache.set(resolved, persisted);
-    return persisted;
-  }
-
   const graph = await buildCodeGraph(resolved, extraExtensions);
   // Strip symbol fields when serving as a plain CodeGraph
   const plain: CodeGraph = { nodes: graph.nodes, edges: graph.edges };
   graphCache.set(resolved, plain);
   return plain;
+}
+
+/** Get a cached or persisted graph without creating one when it is absent. */
+export async function getExistingGraph(projectPath: string): Promise<CodeGraph | null> {
+  const resolved = path.resolve(projectPath);
+  const cached = graphCache.get(resolved);
+  if (cached) return cached;
+
+  const projectId = projectIdFromPath(resolved);
+  const graphCollName = graphCollectionName(projectId);
+  const persisted = await loadGraphData(graphCollName);
+  if (!persisted) return null;
+
+  graphCache.set(resolved, persisted);
+  return persisted;
 }
 
 /** Options for `rebuildGraph` controlling which layers are rebuilt. */
@@ -588,74 +594,177 @@ export function getDynamicLanguageStatus(): DynamicLanguageStatus {
   };
 }
 
+/**
+ * Whether the GDScript tree-sitter parser was successfully registered.
+ * tree-sitter-gdscript ships platform-specific prebuilds; on platforms
+ * without a compatible artifact (e.g. linux-arm64) this stays false so
+ * callers can skip AST processing and use syntax-aware fallback extraction.
+ */
+export let gdscriptParserAvailable = false;
+
+/**
+ * Preflight the tree-sitter-gdscript native addon in an isolated child
+ * process. This validates three things that a simple accessSync cannot:
+ *
+ *   1. The N-API addon loads (require does not throw).
+ *   2. It exposes a tree-sitter language object.
+ *   3. ast-grep can load its `tree_sitter_gdscript` symbol and parse a snippet.
+ *
+ * Running in a child process is essential because
+ * `registerDynamicLanguage` replaces all globally registered languages on
+ * each call — a failed registration in the parent would wipe out the
+ * other dynamic languages before we even try to batch them.
+ *
+ * The child resolves `node-gyp-build` from the tree-sitter-gdscript
+ * package's own context (via createRequire rooted at its package.json),
+ * so it does not rely on npm's hoisted node_modules layout.
+ *
+ * @param gdscriptPkgPath - Absolute path to tree-sitter-gdscript/package.json
+ * @returns The resolved native artifact path on success, null on failure.
+ */
+function preflightGdscriptAddon(gdscriptPkgPath: string): string | null {
+  const preflightScript = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "gdscript-preflight.cjs",
+  );
+  try {
+    const stdout = execFileSync(process.execPath, [preflightScript, gdscriptPkgPath], {
+      timeout: 10_000,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    // On success the preflight prints: "PREFLIGHT: OK <nativePath>"
+    const match = stdout.match(/^PREFLIGHT: OK (.+)$/m);
+    if (match) return match[1];
+    // If we get here, exit code was 0 but output was unexpected
+    logger.warn("GDScript preflight: unexpected output", { stdout });
+    return null;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Extract stderr from the child process error
+    const stderr = (err as { stderr?: string })?.stderr?.trim() ?? message;
+    failedDynamicLanguages.set("gdscript", stderr);
+    logger.warn("GDScript preflight failed", { error: stderr });
+    return null;
+  }
+}
+
 export function ensureDynamicLanguages(): void {
   if (dynamicLangsRegistered) return;
-  dynamicLangsRegistered = true;
 
-  try {
-    const survivors: Record<string, AstGrepLangModule> = {};
+  const langPackages: Array<[string, string]> = [
+    ["python",  "@ast-grep/lang-python"],
+    ["go",      "@ast-grep/lang-go"],
+    ["java",    "@ast-grep/lang-java"],
+    ["rust",    "@ast-grep/lang-rust"],
+    ["c",       "@ast-grep/lang-c"],
+    ["cpp",     "@ast-grep/lang-cpp"],
+    ["csharp",  "@ast-grep/lang-csharp"],
+    ["ruby",    "@ast-grep/lang-ruby"],
+    ["kotlin",  "@ast-grep/lang-kotlin"],
+    ["swift",   "@ast-grep/lang-swift"],
+    ["scala",   "@ast-grep/lang-scala"],
+    ["bash",    "@ast-grep/lang-bash"],
+    ["php",     "@ast-grep/lang-php"],
+    ["lua",     "@ast-grep/lang-lua"],
+    ["dart",    "@ast-grep/lang-dart"],
+    ["elixir",  "@ast-grep/lang-elixir"],
+  ];
 
-    const langPackages: Array<[string, string]> = [
-      ["python",  "@ast-grep/lang-python"],
-      ["go",      "@ast-grep/lang-go"],
-      ["java",    "@ast-grep/lang-java"],
-      ["rust",    "@ast-grep/lang-rust"],
-      ["c",       "@ast-grep/lang-c"],
-      ["cpp",     "@ast-grep/lang-cpp"],
-      ["csharp",  "@ast-grep/lang-csharp"],
-      ["ruby",    "@ast-grep/lang-ruby"],
-      ["kotlin",  "@ast-grep/lang-kotlin"],
-      ["swift",   "@ast-grep/lang-swift"],
-      ["scala",   "@ast-grep/lang-scala"],
-      ["bash",    "@ast-grep/lang-bash"],
-      ["php",     "@ast-grep/lang-php"],
-      ["lua",     "@ast-grep/lang-lua"],
-      ["dart",    "@ast-grep/lang-dart"],
-      ["elixir",  "@ast-grep/lang-elixir"],
-    ];
+  // Phase 1: Pre-validate each @ast-grep/lang-* grammar individually.
+  // A throwing libraryPath getter is isolated to its own grammar so the
+  // rest can still be registered. We do NOT add to loadedDynamicLanguages
+  // yet — that happens only after the batch succeeds.
+  const survivors: Record<string, AstGrepLangModule> = {};
+  const pendingLoaded = new Set<string>();
 
-    for (const [name, pkg] of langPackages) {
-      try {
-        const mod = esmRequire(pkg) as AstGrepLangModule;
-        // Pre-validate the lazy `libraryPath` getter. `registerDynamicLanguage`
-        // accesses this property for every entry it receives, and a single
-        // throwing getter aborts the entire batch atomically (issue #43).
-        // Touching the getter here, inside the per-grammar try/catch, isolates
-        // a missing-prebuild failure to that one grammar so the rest can still
-        // be registered. The getter caches its result inside the package, so
-        // this is not duplicated work.
-        void mod.libraryPath;
-        survivors[name] = mod;
-        loadedDynamicLanguages.add(name);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        failedDynamicLanguages.set(name, message);
-        logger.warn("ast-grep grammar failed to load", { name, error: message });
-      }
+  for (const [name, pkg] of langPackages) {
+    try {
+      const mod = esmRequire(pkg) as AstGrepLangModule;
+      // Pre-validate the lazy `libraryPath` getter. registerDynamicLanguage
+      // accesses this property for every entry, and a single throwing
+      // getter aborts the entire batch atomically (issue #43).
+      void mod.libraryPath;
+      survivors[name] = mod;
+      pendingLoaded.add(name);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      failedDynamicLanguages.set(name, message);
+      logger.warn("ast-grep grammar failed to load", { name, error: message });
     }
+  }
 
-    if (Object.keys(survivors).length > 0) {
+  // Phase 2: Preflight the GDScript native addon in an isolated child
+  // process. This validates the N-API addon loads, exports
+  // tree_sitter_gdscript, and ast-grep can parse with it — without
+  // risking the parent process's global language registry.
+  let gdscriptNativePath: string | null = null;
+  try {
+    const gdscriptPkgPath = esmRequire.resolve("tree-sitter-gdscript/package.json");
+    gdscriptNativePath = preflightGdscriptAddon(gdscriptPkgPath);
+    if (gdscriptNativePath) {
+      survivors.gdscript = {
+        libraryPath: gdscriptNativePath,
+        extensions: ["gd"],
+        languageSymbol: "tree_sitter_gdscript",
+      };
+      pendingLoaded.add("gdscript");
+    }
+    // If preflight returned null, the failure was already recorded in
+    // failedDynamicLanguages by preflightGdscriptAddon.
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    failedDynamicLanguages.set("gdscript", message);
+    logger.warn("ast-grep grammar failed to load", { name: "gdscript", error: message });
+  }
+
+  // Phase 3: Register all validated grammars in a single batch call.
+  // registerDynamicLanguage replaces all previously registered languages
+  // on each call, so every grammar must be in this one batch.
+  if (Object.keys(survivors).length > 0) {
+    try {
       registerDynamicLanguage(survivors);
+      // Batch succeeded — mark all survivors as loaded and clear any
+      // stale failure entries from a previous failed attempt.
+      for (const name of pendingLoaded) {
+        loadedDynamicLanguages.add(name);
+        failedDynamicLanguages.delete(name);
+      }
+      if (survivors.gdscript) {
+        gdscriptParserAvailable = true;
+      }
       logger.info("Registered dynamic ast-grep languages", {
         languages: [...loadedDynamicLanguages].sort(),
       });
-    } else {
+    } catch (err) {
+      // Batch failed — every candidate in the batch is affected.
+      // Record failure for all pending languages and keep retry
+      // state accurate by NOT setting dynamicLangsRegistered.
+      const message = err instanceof Error ? err.message : String(err);
+      for (const name of pendingLoaded) {
+        failedDynamicLanguages.set(name, message);
+      }
       logger.warn(
-        "No dynamic ast-grep grammars loaded; PHP, Python, JVM and other dynamic languages will fall through to <module>-only extraction",
+        "Dynamic language batch registration failed; all candidates affected",
+        { error: message, candidates: [...pendingLoaded].sort() },
       );
+      // Do NOT set dynamicLangsRegistered — allow a retry on next call.
+      return;
     }
-    if (failedDynamicLanguages.size > 0) {
-      logger.warn(
-        "Some dynamic ast-grep grammars failed to load; affected languages will produce only <module>-level symbols",
-        { failed: [...failedDynamicLanguages.keys()].sort() },
-      );
-    }
-  } catch (err) {
-    // Should be unreachable now that each grammar is validated independently,
-    // but keep the outer guard so an unexpected throw cannot take the indexer
-    // process down.
-    logger.warn("Unexpected error in ensureDynamicLanguages", { error: String(err) });
+  } else {
+    logger.warn(
+      "No dynamic ast-grep grammars loaded; PHP, Python, JVM and other dynamic languages will fall through to <module>-only extraction",
+    );
   }
+
+  if (failedDynamicLanguages.size > 0) {
+    logger.warn(
+      "Some dynamic ast-grep grammars failed to load; affected languages will produce only <module>-level symbols",
+      { failed: [...failedDynamicLanguages.keys()].sort() },
+    );
+  }
+
+  dynamicLangsRegistered = true;
 }
 
 // ── Language mapping for ast-grep ────────────────────────────────────────
@@ -679,6 +788,7 @@ const EXTENSION_TO_AST_GREP_LANG: Record<string, Lang | string> = {
   ".ex": "elixir", ".exs": "elixir",
   ".lua": "lua",
   ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+  ".gd": "gdscript",
   // Composite languages (parsed via HTML + script re-parse)
   ".svelte": "svelte",
   ".vue": "vue",
@@ -775,7 +885,11 @@ export async function getGraphableFiles(
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         // Mixed Elixir templates use dedicated parsers, not the Elixir grammar.
-        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext)) {
+        // Godot resource files (.tscn/.tres) have no AST grammar but use tokenizer-based
+        // import extraction for [ext_resource] declarations.
+        const isGodotResource = ext === ".tscn" || ext === ".tres";
+        const isGodotUid = ext === ".uid";
+        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext) || isGodotResource || isGodotUid) {
           files.push(relPath);
         } else if (ext === "" && (includeDotFiles || !entry.name.startsWith("."))) {
           // Extensionless: admit only when detection yields a grammar-bearing
@@ -840,6 +954,26 @@ export async function buildCodeGraph(
   if (files.some((file) => isElixirTemplateExtension(path.extname(file)))) {
     await ensureElixirTemplateParsers();
   }
+
+  // Build GDScript class_name index once for O(1) extends resolution.
+  // Scans all .gd files in a single pass; avoids 68k+ redundant reads for
+  // large Godot projects where every file has an extends statement.
+  // Per-Godot-project: each project.godot root gets its own class_name index
+  // so class names in one Godot project don't leak into another.
+  const hasGdscript = files.some((f) => f.endsWith(".gd"));
+  const hasGodotFiles = hasGdscript || files.some((f) => f.endsWith(".tscn") || f.endsWith(".tres"));
+  const godotRootCache = new Map<string, string | null>();
+  // Per-project Godot indexes: maps each Godot project root to its scoped
+  // class_name index. Used for per-file res:// and extends resolution.
+  const godotProjectIndexes = hasGodotFiles
+    ? buildGodotProjectIndexes(resolvedPath, fileSet, godotRootCache)
+    : undefined;
+  // Per-project UID indexes: maps each Godot project root to its scoped
+  // uid:// → relative path index. Used for uid:// resolution in GDScript
+  // and Godot resource files. Godot prefers UIDs over text paths.
+  const godotProjectUidIndexes = hasGodotFiles
+    ? buildGodotUidIndexes(resolvedPath, fileSet, godotRootCache)
+    : undefined;
 
   if (progress) {
     progress.filesTotal = files.length;
@@ -1012,9 +1146,20 @@ export async function buildCodeGraph(
     }
 
     // Extra extensions with no parser are included as leaf nodes so they can be
-    // targets of import edges, but we skip
-    // import extraction since we can't parse them.
-    if (!lang && !isElixirTemplate) {
+    // targets of import edges, but we skip import extraction since we can't
+    // parse them. Godot resource files (.tscn/.tres) are an exception: they
+    // have no AST grammar but use tokenizer-based import extraction for
+    // [ext_resource] declarations, so they pass through to
+    // the extraction path below.
+    const isGodotResource = ext === ".tscn" || ext === ".tres";
+    const isGodotUid = ext === ".uid";
+    // Sidecars stay in fileSet so the UID index can read them, but they are
+    // metadata rather than graph nodes and never enter the source-read path.
+    if (isGodotUid) {
+      if (progress) progress.filesProcessed++;
+      continue;
+    }
+    if (!lang && !isElixirTemplate && !isGodotResource) {
       const absolutePath = path.join(resolvedPath, relPath);
       if (!nodesMap.has(relPath)) {
         nodesMap.set(relPath, {
@@ -1089,7 +1234,7 @@ export async function buildCodeGraph(
     // as plaintext.
     node.language = language;
 
-    const extractionLang = lang ?? "elixir-template";
+    const extractionLang = lang ?? (isGodotResource ? "godot-resource" : "elixir-template");
     const importInfos = extractImports(source, extractionLang, ext);
 
     // Extract symbols & raw call sites in the same pass
@@ -1148,6 +1293,32 @@ export async function buildCodeGraph(
       if (imp.declaredName) declaredMods.set(imp.declaredName, imp.moduleSpecifier);
     }
 
+    // Per-file Godot project root and scoped class_name index.
+    // Computed once per file, outside the import loop, since the root
+    // does not change between imports from the same file.
+    // Each Godot source file resolves res:// and extends relative to its
+    // nearest project.godot ancestor, with class_name lookups scoped to
+    // that same project. This supports repos with multiple Godot projects.
+    // When per-project indexes are available but a file has no project.godot
+    // ancestor, both root and index are null/undefined — class_name and
+    // res:// resolution are skipped for that file, matching Godot's
+    // project-scoped semantics.
+    // Non-Godot files skip this lookup entirely (the parameters are ignored
+    // by their resolveImport case) to avoid unnecessary filesystem walks.
+    let fileGodotRoot: string | null | undefined;
+    let fileClassNameIndex: ClassNameIndex | undefined;
+    let fileUidIndex: GodotUidIndex | undefined;
+    const isGodotFile = language === "gdscript" || language === "godot-resource";
+    if (godotProjectIndexes && isGodotFile) {
+      fileGodotRoot = findGodotRootForFile(absolutePath, godotProjectIndexes, godotRootCache);
+      if (fileGodotRoot) {
+        fileClassNameIndex = godotProjectIndexes.get(fileGodotRoot);
+        fileUidIndex = godotProjectUidIndexes?.get(fileGodotRoot);
+      }
+      // fileClassNameIndex stays undefined when no project root is found,
+      // preventing cross-project class_name leakage.
+    }
+
     for (const imp of importInfos) {
       node.imports.push(imp.moduleSpecifier);
 
@@ -1162,7 +1333,7 @@ export async function buildCodeGraph(
       // unaffected: there the path is absolute from the crate root and never
       // consulted the map to begin with.
       const scopedMods = imp.fromInlineBlock ? EMPTY_DECLARED_MODS : declaredMods;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true);
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true, fileClassNameIndex, fileGodotRoot, fileUidIndex, imp.fallbackSpecifier, imp.godotImportKind);
       if (resolved) {
         node.dependencies.push(resolved);
 

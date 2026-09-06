@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
 import { collectionName, projectIdFromPath } from "../config.js";
-import { mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
+import { getWatcherMode, mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
 import { awaitGraphBuild, isGraphBuildInProgress } from "../services/code-graph.js";
 import type { InfraProgressCallback } from "../services/docker.js";
 import { ensureQdrantReady, isDockerAvailable } from "../services/docker.js";
@@ -11,7 +11,7 @@ import { getIndexingProgress, indexProject, isIndexingInProgress, removeProjectI
 import { isProjectLocked, terminateLockHolder } from "../services/lock.js";
 import { logger } from "../services/logger.js";
 import { loadEffectiveIndexProfileForCollection } from "../services/qdrant.js";
-import { getWatchedProjects, isWatching, startWatching, stopWatching } from "../services/watcher.js";
+import { getWatchedProjects, isWatching, startWatching, startWatchingAutomatically, stopWatching } from "../services/watcher.js";
 
 const DOCKER_NOT_AVAILABLE_MESSAGE = [
   "❌ Docker is not available.",
@@ -142,7 +142,7 @@ export async function handleIndexTool(
 
           // Auto-start watcher only if indexing completed (not cancelled)
           if (!result.cancelled && !isWatching(resolved)) {
-            const started = await startWatching(resolved);
+            const started = await startWatchingAutomatically(resolved);
             if (started) {
               logger.info("Auto-started file watcher", { projectPath: resolved });
             }
@@ -194,7 +194,7 @@ export async function handleIndexTool(
 
       // Auto-start watcher after successful update (not cancelled)
       if (!result.cancelled && !isWatching(resolved)) {
-        const started = await startWatching(resolved);
+        const started = await startWatchingAutomatically(resolved);
         if (started) {
           logger.info("Auto-started file watcher after update", { projectPath: resolved });
         }
@@ -344,8 +344,16 @@ export async function handleIndexTool(
 
     case "codebase_watch": {
       const action = args.action as string;
+      const watcherMode = getWatcherMode();
 
       if (action === "start") {
+        if (watcherMode === "off") {
+          return [
+            "File watcher disabled by SOCRATICODE_WATCHER=off.",
+            "Set SOCRATICODE_WATCHER=manual or auto and restart the MCP server before starting it.",
+          ].join("\n");
+        }
+
         await ensureInfrastructure(projectPath);
 
         // Catch any changes made while the watcher was not running before starting it.
@@ -389,14 +397,36 @@ export async function handleIndexTool(
       const resolved = path.resolve(projectPath);
       // Check if the current project is watched by another process (cross-process lock)
       const watchedByOtherProcess = !watched.includes(resolved) && await isProjectLocked(resolved, "watch");
+
+      if (watcherMode === "off") {
+        const lines = ["File watcher: disabled (SOCRATICODE_WATCHER=off)"];
+        if (watched.includes(resolved)) {
+          lines.push(
+            "Warning: this process still has an active watcher. Restart the MCP server to apply the changed environment setting.",
+          );
+        } else if (watchedByOtherProcess) {
+          lines.push(
+            "Warning: another MCP process is still watching this project. Set SOCRATICODE_WATCHER=off for every process that uses this checkout.",
+          );
+        }
+        return lines.join("\n");
+      }
+
       if (watched.length === 0 && !watchedByOtherProcess) {
+        if (watcherMode === "manual") {
+          return [
+            "No projects are currently being watched.",
+            "Automatic watcher startup is disabled by SOCRATICODE_WATCHER=manual; use codebase_watch with action=start to start it explicitly.",
+          ].join("\n");
+        }
         return "No projects are currently being watched.";
       }
       const statusItems = watched.map((p) => `  - ${p}`);
       if (watchedByOtherProcess) {
         statusItems.push(`  - ${resolved} (watched by another process)`);
       }
-      return `Currently watching:\n${statusItems.join("\n")}`;
+      const modeLine = watcherMode === "manual" ? "\nWatcher mode: manual (started explicitly)" : "";
+      return `Currently watching:\n${statusItems.join("\n")}${modeLine}`;
     }
 
     default:

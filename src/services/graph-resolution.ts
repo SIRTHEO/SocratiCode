@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
-import { type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { parse as parseToml, type TomlTable, type TomlValue } from "smol-toml";
 import { toForwardSlash } from "../constants.js";
+import { extractClassNameFromGdscript } from "./gdscript-syntax.js";
 import type { PathAliases } from "./graph-aliases.js";
 import { extractSymbolsAndCalls } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -2247,6 +2248,239 @@ export function resolveRustImport(
 }
 
 /**
+ * Pre-built index mapping GDScript class_name declarations to their file paths.
+ * Normal graph construction builds one scoped index per Godot project with
+ * buildGodotProjectIndexes() to avoid repeated file reads and cross-project
+ * name leakage.
+ */
+export type ClassNameIndex = Map<string, string>;
+
+/**
+ * Scan all .gd files in a fileSet for `class_name X` declarations and build
+ * a global Map<className, relativePath>.
+ *
+ * @deprecated Legacy helper retained for compatibility. New graph-building
+ * code should use buildGodotProjectIndexes() so class names remain scoped to
+ * their nearest Godot project.
+ */
+export function buildClassNameIndex(
+  projectPath: string,
+  fileSet: Set<string>,
+): ClassNameIndex {
+  const index: ClassNameIndex = new Map();
+  for (const relPath of fileSet) {
+    if (!relPath.endsWith(".gd")) continue;
+    const absPath = path.join(projectPath, relPath);
+    try {
+      const content = readFileSync(absPath, "utf-8");
+      const className = extractClassNameFromGdscript(content);
+      if (className) {
+        index.set(className, relPath);
+      }
+    } catch {
+      // Skip unreadable files
+    }
+  }
+  return index;
+}
+
+/**
+ * A per-Godot-project class_name index. Maps each Godot project root
+ * (absolute path to the directory containing project.godot) to a
+ * ClassNameIndex scoped to the .gd files under that root.
+ *
+ * This supports repositories with multiple Godot projects (nested or
+ * sibling), where each project has its own class_name registry and
+ * res:// root. A class_name in one project must not resolve extends
+ * in another project.
+ */
+export type GodotProjectIndexes = Map<string, ClassNameIndex>;
+
+/**
+ * A per-Godot-project UID index. Maps `uid://...` strings to relative
+ * file paths within the project. Built from `.uid` sidecar files and
+ * `uid="uid://..."` attributes in `.tscn`/`.tres` file headers.
+ *
+ * Godot prefers UIDs over text paths for resource loading. When both
+ * are present in an `[ext_resource]` declaration, the UID takes priority
+ * and the text path is used only as a fallback when the UID cannot be
+ * resolved.
+ */
+export type GodotUidIndex = Map<string, string>;
+export type GodotProjectUidIndexes = Map<string, GodotUidIndex>;
+/** Per-graph-build cache for nearest project.godot lookups. */
+export type GodotRootCache = Map<string, string | null>;
+
+/**
+ * Build per-Godot-project UID indexes from `.uid` sidecar files and
+ * `.tscn`/`.tres` file headers.
+ *
+ * For each `.uid` sidecar file (e.g. `Player.gd.uid`), reads the UID
+ * string and maps it to the corresponding resource file. For `.tscn`
+ * and `.tres` files, parses the `uid="uid://..."` attribute from the
+ * file header.
+ *
+ * @param projectPath - Absolute path to the SocratiCode indexing root
+ * @param fileSet - Set of relative file paths
+ * @returns Map of Godot project root (absolute) → UID index (uid:// → relative path)
+ */
+export function buildGodotUidIndexes(
+  projectPath: string,
+  fileSet: Set<string>,
+  rootCache: GodotRootCache = new Map(),
+): GodotProjectUidIndexes {
+  const indexes: GodotProjectUidIndexes = new Map();
+
+  for (const relPath of fileSet) {
+    // .uid sidecar files: <file>.uid contains a single line "uid://..."
+    if (relPath.endsWith(".uid")) {
+      const absPath = path.join(projectPath, relPath);
+      const godotRoot = walkUpForGodotProject(path.dirname(absPath), rootCache);
+      if (!godotRoot) continue;
+
+      let index = indexes.get(godotRoot);
+      if (!index) {
+        index = new Map();
+        indexes.set(godotRoot, index);
+      }
+
+      try {
+        const content = readFileSync(absPath, "utf-8").trim();
+        if (content.startsWith("uid://")) {
+          // The resource file is the .uid path without the .uid suffix
+          const resourcePath = relPath.slice(0, -4); // strip ".uid"
+          // A stale sidecar must not create a graph node for a missing file.
+          if (fileSet.has(resourcePath)) index.set(content, resourcePath);
+        }
+      } catch {
+        // Skip unreadable files
+      }
+      continue;
+    }
+
+    // .tscn/.tres files: parse uid="uid://..." from the file header
+    if (relPath.endsWith(".tscn") || relPath.endsWith(".tres")) {
+      const absPath = path.join(projectPath, relPath);
+      const godotRoot = walkUpForGodotProject(path.dirname(absPath), rootCache);
+      if (!godotRoot) continue;
+
+      let index = indexes.get(godotRoot);
+      if (!index) {
+        index = new Map();
+        indexes.set(godotRoot, index);
+      }
+
+      try {
+        const content = readFileSync(absPath, "utf-8");
+        // The uid attribute appears in the first section header:
+        // [gd_scene ... uid="uid://..."] or [gd_resource ... uid="uid://..."]
+        const match = content.match(/^\[gd_(?:scene|resource)\b[^\]]*\buid="(uid:\/\/[^"]+)"/m);
+        if (match) {
+          index.set(match[1], relPath);
+        }
+      } catch {
+        // Skip unreadable files
+      }
+    }
+  }
+
+  return indexes;
+}
+
+/**
+ * Build per-Godot-project class_name indexes for a set of files.
+ *
+ * For each .gd file, finds the nearest project.godot ancestor and adds
+ * the file's class_name to that project's index. Files not under any
+ * project.godot are skipped (they have no Godot project context).
+ *
+ * @param projectPath - Absolute path to the SocratiCode indexing root
+ * @param fileSet - Set of relative file paths
+ * @returns Map of Godot project root (absolute) → ClassNameIndex (relative paths)
+ */
+export function buildGodotProjectIndexes(
+  projectPath: string,
+  fileSet: Set<string>,
+  rootCache: GodotRootCache = new Map(),
+): GodotProjectIndexes {
+  const indexes: GodotProjectIndexes = new Map();
+
+  // Scan .gd, .tscn, and .tres files. .gd files contribute class_name
+  // entries to their project's index. .tscn/.tres files are scanned only
+  // to discover resource-only nested projects (a project with no .gd files
+  // but with .tscn/.tres files still needs its root in the map so that
+  // res:// paths in those resource files resolve correctly).
+  for (const relPath of fileSet) {
+    const isGd = relPath.endsWith(".gd");
+    const isResource = relPath.endsWith(".tscn") || relPath.endsWith(".tres");
+    if (!isGd && !isResource) continue;
+
+    const absPath = path.join(projectPath, relPath);
+    const godotRoot = walkUpForGodotProject(path.dirname(absPath), rootCache);
+    if (!godotRoot) continue;
+
+    // Ensure this project root is in the map (even if the file has no
+    // class_name — resource-only projects need an entry).
+    let index = indexes.get(godotRoot);
+    if (!index) {
+      index = new Map();
+      indexes.set(godotRoot, index);
+    }
+
+    // Only .gd files can contribute class_name entries
+    if (!isGd) continue;
+
+    try {
+      const content = readFileSync(absPath, "utf-8");
+      const className = extractClassNameFromGdscript(content);
+      if (className) {
+        index.set(className, relPath);
+      }
+    } catch {
+      // Skip unreadable files
+    }
+  }
+
+  return indexes;
+}
+
+/**
+ * Find the nearest Godot project root for a given source file.
+ *
+ * Walks up from the file's directory looking for project.godot.
+ * Returns the absolute path to the directory containing it, or null
+ * if no project.godot is found. This is per-file (not per-repo) to
+ * support repositories with multiple Godot projects.
+ *
+ * @param sourceFile - Absolute path to the source file
+ * @param godotProjectIndexes - Retained for compatibility with existing callers.
+ * @param rootCache - Optional cache scoped to one graph build.
+ */
+export function findGodotRootForFile(
+  sourceFile: string,
+  _godotProjectIndexes?: GodotProjectIndexes,
+  rootCache: GodotRootCache = new Map(),
+): string | null {
+  // Always walk the filesystem from the file's directory to find the
+  // NEAREST project.godot. This is critical for nested projects:
+  //
+  //   repo/project.godot
+  //   repo/outer.gd
+  //   repo/game/project.godot
+  //   repo/game/scene.tscn
+  //
+  // scene.tscn must resolve to repo/game (the nearest root), not repo
+  // (an outer root that happens to be in the indexes map). The indexes
+  // map is a cache of known roots, but it does not prove that a known
+  // root is the *nearest* one — a nearer project.godot may exist on
+  // disk that was not in the fileSet when the indexes were built.
+  //
+  // The filesystem walk is cheap (stat calls walking up from the file's
+  // directory, typically 1-3 hops) and guarantees correctness.
+  return walkUpForGodotProject(path.dirname(sourceFile), rootCache);
+}
+
+/**
  * Resolve a module specifier to a relative file path within the project.
  * Returns null if the module is external (e.g., npm package, stdlib).
  *
@@ -2256,6 +2490,17 @@ export function resolveRustImport(
  * grammar names ("JavaScript", "TypeScript", "Tsx", "Html", "Css") match no
  * case. Not every display label has one either, so a switch miss is always
  * possible, and it returns the same null an external module does.
+ *
+ * @param aliases - Optional path aliases (tsconfig/jsconfig paths) for JS/TS resolution
+ * @param classNameIndex - Pre-built GDScript class_name → file path index for O(1) extends resolution
+ * @param godotProjectRoot - Pre-resolved Godot project root (directory containing project.godot).
+ *   When provided, res:// paths resolve relative to this instead of walking the filesystem per call.
+ * @param godotUidIndex - Pre-built UID → relative path index for uid:// resolution.
+ *   When provided, uid:// paths are resolved via this index. When absent,
+ *   uid:// paths cannot be resolved and return null.
+ * @param fallbackSpecifier - Optional path fallback for a primary uid:// specifier.
+ * @param godotImportKind - GDScript construct that supplied the path. Runtime
+ *   load paths use the Godot project root; extends and preload use the source directory.
  */
 export function resolveImport(
   moduleSpecifier: string,
@@ -2275,6 +2520,11 @@ export function resolveImport(
   rustCrates?: RustCrate[],
   rustDeclaredMods?: Map<string, string>,
   rustIsDeclaration?: boolean,
+  classNameIndex?: ClassNameIndex,
+  godotProjectRoot?: string | null,
+  godotUidIndex?: GodotUidIndex,
+  fallbackSpecifier?: string,
+  godotImportKind?: "extends" | "preload" | "load",
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -2687,6 +2937,117 @@ export function resolveImport(
       return resolveRelativePath(luaPath, projectPath, projectPath, fileSet, [".lua"]);
     }
 
+    case "gdscript": {
+      // uid:// paths — resolve via the UID index (Godot prefers UIDs
+      // over text paths for resource loading)
+      if (moduleSpecifier.startsWith("uid://")) {
+        if (godotUidIndex) {
+          const resolved = godotUidIndex.get(moduleSpecifier);
+          if (resolved) return resolved;
+        }
+        // Try fallback specifier (path from ext_resource) if UID resolution missed
+        if (fallbackSpecifier) {
+          return resolveImport(
+            fallbackSpecifier, sourceFile, projectPath, fileSet, language,
+            aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo,
+            phpPsr4Map, dartPackageMap, pythonImportRoots,
+            elixirModuleMap, phpFqcnMap,
+            rustCrates, rustDeclaredMods, rustIsDeclaration,
+            classNameIndex, godotProjectRoot, godotUidIndex,
+            undefined, godotImportKind,
+          );
+        }
+        // Without a UID index or fallback, uid:// paths cannot be resolved
+        return null;
+      }
+      // preload/load: res://path/to/file.gd → resolve relative to Godot project root
+      if (moduleSpecifier.startsWith("res://")) {
+        const resPath = moduleSpecifier.slice("res://".length);
+        if (resPath.endsWith(".uid")) return null;
+        // Use pre-resolved root if available; fall back to filesystem walk for ad-hoc calls
+        const godotRoot = godotProjectRoot !== undefined ? godotProjectRoot : findGodotProjectRoot(sourceFile);
+        // Do NOT fall back to projectPath when no Godot root is found.
+        // res:// is Godot-specific and must resolve relative to a project.godot
+        // directory. Falling back to the arbitrary SocratiCode indexing root
+        // would produce false edges in repos without a Godot project.
+        if (!godotRoot) return null;
+        // Direct file-set matching only — no extension fallback. res:// paths
+        // in GDScript are explicit (res://scripts/Player.gd), so the specifier
+        // already includes the correct extension. Adding fallback extensions
+        // would falsely resolve res://assets/player.png to assets/player.tscn
+        // when the .png is not in the project file set.
+        return resolveRelativePath(resPath, godotRoot, projectPath, fileSet, []);
+      }
+      // Relative extends/preload paths use the script directory. Runtime
+      // load() paths are localized by ResourceLoader against the res:// root.
+      // Callers predating godotImportKind retain the previous source-relative
+      // behavior, preserving the public resolver helper's compatibility.
+      // Exclude class: prefixed specifiers and scheme:// paths.
+      if (!path.isAbsolute(moduleSpecifier) && !moduleSpecifier.includes("://") && !moduleSpecifier.startsWith("class:")) {
+        if (moduleSpecifier.endsWith(".uid")) return null;
+        if (godotImportKind === "load") {
+          const godotRoot = godotProjectRoot !== undefined ? godotProjectRoot : findGodotProjectRoot(sourceFile);
+          if (!godotRoot) return null;
+          return resolveRelativePath(moduleSpecifier, godotRoot, projectPath, fileSet, []);
+        }
+        return resolveRelativePath(moduleSpecifier, path.dirname(sourceFile), projectPath, fileSet, []);
+      }
+      // extends ClassName → resolve via class_name convention
+      // The import extractor prefixes class-name references with "class:"
+      if (moduleSpecifier.startsWith("class:")) {
+        // class_name resolution is project-scoped: without a Godot project
+        // root (explicit null), do not attempt resolution. An undefined
+        // godotProjectRoot means the caller didn't pre-resolve it (ad-hoc
+        // calls, tests) — fall back to filesystem walk in resolveByClassName.
+        if (godotProjectRoot === null) return null;
+        const className = moduleSpecifier.slice("class:".length);
+        return resolveByClassName(className, sourceFile, projectPath, fileSet, classNameIndex);
+      }
+      return null;
+    }
+
+    case "godot-resource": {
+      // uid:// paths — resolve via the UID index (Godot prefers UIDs
+      // over text paths for resource loading)
+      if (moduleSpecifier.startsWith("uid://")) {
+        if (godotUidIndex) {
+          const resolved = godotUidIndex.get(moduleSpecifier);
+          if (resolved) return resolved;
+        }
+        // Try fallback specifier (path from ext_resource) if UID resolution missed
+        if (fallbackSpecifier) {
+          return resolveImport(
+            fallbackSpecifier, sourceFile, projectPath, fileSet, language,
+            aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo,
+            phpPsr4Map, dartPackageMap, pythonImportRoots,
+            elixirModuleMap, phpFqcnMap,
+            rustCrates, rustDeclaredMods, rustIsDeclaration,
+            classNameIndex, godotProjectRoot, godotUidIndex,
+          );
+        }
+        // Without a UID index or fallback, uid:// paths cannot be resolved
+        return null;
+      }
+      // .tscn/.tres files reference other resources via [ext_resource]
+      // declarations with res:// paths or relative paths.
+      if (moduleSpecifier.startsWith("res://")) {
+        const resPath = moduleSpecifier.slice("res://".length);
+        if (resPath.endsWith(".uid")) return null;
+        const godotRoot = godotProjectRoot !== undefined ? godotProjectRoot : findGodotProjectRoot(sourceFile);
+        // Do NOT fall back to projectPath — res:// is Godot-specific.
+        if (!godotRoot) return null;
+        return resolveRelativePath(resPath, godotRoot, projectPath, fileSet, []);
+      }
+      // Relative path (e.g. "material.tres") — resolve relative to the
+      // directory containing the .tscn/.tres file, per Godot TSCN docs.
+      if (!path.isAbsolute(moduleSpecifier)) {
+        if (moduleSpecifier.endsWith(".uid")) return null;
+        const sourceDir = path.dirname(sourceFile);
+        return resolveRelativePath(moduleSpecifier, sourceDir, projectPath, fileSet, []);
+      }
+      return null;
+    }
+
     default:
       return null;
   }
@@ -2736,6 +3097,20 @@ function isExternalModule(spec: string, language: string): boolean {
       // Common Lua stdlib/C modules
       return ["string", "table", "math", "io", "os", "coroutine",
               "debug", "package", "utf8", "bit32"].includes(spec.split(".")[0]);
+    case "gdscript":
+      // res://, uid://, and class: prefixes are always project-internal.
+      // Relative paths (not starting with / or a scheme) are also internal.
+      // Everything else is treated as external (Godot built-in types like Node2D).
+      if (spec.startsWith("res://") || spec.startsWith("class:") || spec.startsWith("uid://")) return false;
+      // Relative paths: contains a path separator or has a file extension
+      // like .gd, .tscn, .tres — these are file references, not class names
+      if (!path.isAbsolute(spec) && (spec.includes("/") || spec.endsWith(".gd") || spec.endsWith(".tscn") || spec.endsWith(".tres"))) return false;
+      return true;
+    case "godot-resource":
+      // .tscn/.tres files produce res:// paths and relative paths (relative
+      // to the .tscn/.tres file's directory, per Godot TSCN docs).
+      // Both forms are project-internal; there are no external imports.
+      return false;
     default:
       return false;
   }
@@ -2870,6 +3245,117 @@ function resolveRelativePath(
   if (extensions.includes(".py")) {
     const initFile = toForwardSlash(path.join(relPath, "__init__.py"));
     if (fileSet.has(initFile)) return initFile;
+  }
+
+  return null;
+}
+
+/**
+ * Walk up from a starting directory looking for project.godot.
+ * Returns the absolute path to the directory containing it, or null if not
+ * found within 50 levels or at the filesystem root. Shared by both
+ * {@link findGodotProjectRootForProject} and {@link findGodotProjectRoot}.
+ */
+function walkUpForGodotProject(startDir: string, rootCache?: GodotRootCache): string | null {
+  let dir = path.resolve(startDir);
+  const visited: string[] = [];
+  for (let i = 0; i < 50; i++) {
+    if (rootCache?.has(dir)) {
+      const cached = rootCache.get(dir) ?? null;
+      for (const visitedDir of visited) rootCache.set(visitedDir, cached);
+      return cached;
+    }
+    visited.push(dir);
+    const godotProject = path.join(dir, "project.godot");
+    try {
+      if (existsSync(godotProject)) {
+        for (const visitedDir of visited) rootCache?.set(visitedDir, dir);
+        return dir;
+      }
+    } catch {
+      // Ignore stat errors
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // Reached filesystem root
+    dir = parent;
+  }
+  for (const visitedDir of visited) rootCache?.set(visitedDir, null);
+  return null;
+}
+
+/**
+ * Find the Godot project root for a set of files by checking if project.godot
+ * exists at the project path or any parent. Called once per graph build so
+ * that res:// resolution doesn't walk the filesystem for every import.
+ * Returns the absolute path to the directory containing project.godot,
+ * or null if not found.
+ */
+export function findGodotProjectRootForProject(projectPath: string): string | null {
+  return walkUpForGodotProject(path.resolve(projectPath));
+}
+
+/**
+ * Find the Godot project root by walking up from a source file looking for
+ * project.godot. Returns the absolute path to the directory containing it,
+ * or null if not found. Used as a fallback when no pre-resolved root is
+ * passed to resolveImport (tests, ad-hoc calls).
+ */
+function findGodotProjectRoot(sourceFile: string): string | null {
+  return walkUpForGodotProject(path.dirname(sourceFile));
+}
+
+/**
+ * Resolve a GDScript class_name reference to a .gd file.
+ *
+ * Godot class identity comes from the `class_name` declaration, not the
+ * filename. A file named `Foo.gd` that does not declare `class_name Foo`
+ * must never resolve a bare `extends Foo` — Godot itself resolves bare class
+ * references through the globally registered `class_name` table, and an
+ * unnamed script is referenced by path (`preload`/`load`/`res://`), not by
+ * name. So this function consults ONLY `class_name` declarations:
+ *
+ *  - When a classNameIndex is available (normal graph-build path), a single
+ *    O(1) Map lookup with no file reads.
+ *  - Otherwise (tests, ad-hoc calls), a disk scan of `class_name`
+ *    declarations in `.gd` files.
+ *
+ * Filename-based resolution is intentionally NOT performed.
+ */
+function resolveByClassName(
+  className: string,
+  sourceFile: string,
+  projectPath: string,
+  fileSet: Set<string>,
+  classNameIndex?: ClassNameIndex,
+): string | null {
+  const selfRelPath = toForwardSlash(path.relative(projectPath, sourceFile));
+
+  // When an index is available, class_name is the authoritative identity.
+  if (classNameIndex) {
+    const resolved = classNameIndex.get(className);
+    if (resolved && resolved !== selfRelPath) {
+      return resolved;
+    }
+    return null;
+  }
+
+  // Without an index (tests, ad-hoc calls): scan .gd files on disk for
+  // class_name declarations. Filename matching is intentionally skipped —
+  // a file named <ClassName>.gd without a class_name declaration does not
+  // define that class in Godot.
+  for (const relPath of fileSet) {
+    if (!relPath.endsWith(".gd")) continue;
+    if (relPath === selfRelPath) continue;
+    const absPath = path.join(projectPath, relPath);
+    try {
+      const content = readFileSync(absPath, "utf-8");
+      const declaredName = extractClassNameFromGdscript(content);
+      if (declaredName === className) {
+        return relPath;
+      }
+    } catch {
+      // Skip unreadable files
+    }
   }
 
   return null;

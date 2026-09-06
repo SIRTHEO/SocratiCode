@@ -21,7 +21,7 @@ import {
   SUPPORTED_EXTENSIONS
 } from "../constants.js";
 import type { FileChunk } from "../types.js";
-import { ensureDynamicLanguages, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
+import { ensureDynamicLanguages, gdscriptParserAvailable, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
 import { ensureArtifactsIndexed, loadConfig, removeAllArtifacts } from "./context-artifacts.js";
 import { analyzeElixirTemplate, ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir-templates.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
@@ -289,6 +289,11 @@ const TOP_LEVEL_KINDS: Record<string, string[]> = {
   // findAstBoundaries fuses each signature/body pair into one region.
   dart:       ["class_definition", "mixin_declaration", "enum_declaration", "extension_declaration", "type_alias", "function_signature", "function_body"],
   elixir:     ["call"],
+  // GDScript (Godot)
+  gdscript:   ["function_definition", "class_definition", "variable_statement",
+               "export_variable_statement", "onready_variable_statement",
+               "signal_statement", "const_statement", "enum_definition",
+               "extends_statement", "class_name_statement"],
 };
 
 /** Minimum lines for a chunk to stand on its own (otherwise merge with neighbors) */
@@ -309,6 +314,10 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
   const langKey = String(lang);
   const kinds = TOP_LEVEL_KINDS[langKey];
   if (!kinds) return [];
+  // GDScript parser is registered dynamically and may be unavailable on
+  // platforms without a compatible prebuild (e.g. linux-arm64). Skip AST
+  // chunking there — files fall back to line-based chunking.
+  if (langKey === "gdscript" && !gdscriptParserAvailable) return [];
 
   try {
     const root = parse(lang, source).root();
@@ -326,7 +335,8 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
           || parent.kind() === "compilation_unit"
           // Depth 2: e.g., class inside namespace
           || (grandparent && (grandparent.kind() === "program" || grandparent.kind() === "source_file"
-            || grandparent.kind() === "translation_unit" || grandparent.kind() === "compilation_unit"));
+            || grandparent.kind() === "translation_unit" || grandparent.kind() === "compilation_unit"
+            || grandparent.kind() === "source"));
 
         if (isTopLevel) {
           regions.push({ startLine: range.start.line, endLine: range.end.line + 1 });

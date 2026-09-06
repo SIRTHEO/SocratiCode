@@ -15,7 +15,7 @@ import { getSettings } from "./settings.js";
  * their own MCP configuration.
  *
  * The provider returns a single stdio definition that launches the engine
- * via `npx -y socraticode` (overridable via `socraticode.command` /
+ * via `npx -y --prefer-online socraticode@latest` (overridable via `socraticode.command` /
  * `socraticode.args`). The engine's environment is the user-configured
  * `socraticode.env` object passed through unchanged, which is how power
  * users point at an external Qdrant (`QDRANT_MODE=external`, `QDRANT_URL`,

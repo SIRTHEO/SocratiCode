@@ -129,7 +129,7 @@ All commands appear under `SocratiCode:` in the Command Palette.
 | Setting | Default | Purpose |
 |---|---|---|
 | `socraticode.command` | `"npx"` | Engine launcher. |
-| `socraticode.args` | `["-y", "socraticode"]` | Args for the launcher. |
+| `socraticode.args` | `["-y", "--prefer-online", "socraticode@latest"]` | Args for the launcher. npm checks for the latest published engine whenever the server starts. |
 | `socraticode.env` | `{}` | Environment variables forwarded to the engine. Use this to point at an external Qdrant cluster (`QDRANT_MODE=external`, `QDRANT_URL`, `QDRANT_API_KEY`), pick an embedding provider (`EMBEDDING_PROVIDER`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`), enable branch-aware indexing, link multiple projects, or set any other engine knob from the [engine README](https://github.com/giancarloerra/socraticode#configuration). |
 | `socraticode.statusBar` | `true` | Show the status-bar item. |
 
@@ -151,6 +151,9 @@ independent client.
 In Microsoft VS Code, use the Extensions view or run
 `Extensions: Check for Extension Updates`, reload the window, start a new native
 Agent Chat, and verify the final version and server with `MCP: List Servers`.
+This updates the extension's UI and integration files. The separately launched
+MCP engine checks npm for the latest published release whenever that server
+starts, using the default `socraticode.args` shown above.
 In another editor, use that host's extension update flow, restart or reload it
 as documented, verify the registered MCP provider through its server list, and
 use its available agent or chat interface. See the

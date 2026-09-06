@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
 import { projectIdFromPath } from "../config.js";
-import { mergeExtraExtensions, SOCRATICODE_VERSION } from "../constants.js";
-import { awaitGraphBuild, describeGraphBuilder, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getAstGrepLang, getDynamicLanguageStatus, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
+import { getWatcherMode, mergeExtraExtensions, SOCRATICODE_VERSION } from "../constants.js";
+import { awaitGraphBuild, describeGraphBuilder, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getAstGrepLang, getDynamicLanguageStatus, getExistingGraph, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
 import { detectEntryPoints } from "../services/graph-entrypoints.js";
 import {
   type FlowNode,
@@ -38,6 +38,26 @@ const SYMBOL_GRAPH_TOOLS = new Set([
   "codebase_symbol",
   "codebase_symbols",
 ]);
+
+class ExplicitGraphBuildRequiredError extends Error {}
+
+/**
+ * Default mode keeps the historical lazy-build behaviour. Snapshot modes may
+ * read a cached or persisted graph, but must not create one as a side effect of
+ * a query.
+ */
+async function getGraphForRead(projectPath: string) {
+  const watcherMode = getWatcherMode();
+  if (watcherMode === "auto") return getOrBuildGraph(projectPath);
+
+  const graph = await getExistingGraph(projectPath);
+  if (graph) return graph;
+  throw new ExplicitGraphBuildRequiredError(
+    `No code graph found for: ${projectPath}\n` +
+    `Automatic graph creation is disabled by SOCRATICODE_WATCHER=${watcherMode}. ` +
+    "Run codebase_graph_build to create it explicitly.",
+  );
+}
 
 function hasRelevantGrammarFailure(
   failed: Array<{ name: string }>,
@@ -74,6 +94,7 @@ export async function handleGraphTool(
         result,
       ].join("\n");
     } catch (err) {
+      if (err instanceof ExplicitGraphBuildRequiredError) return err.message;
       if (
         err instanceof SymbolGraphGenerationChangedError
         && SYMBOL_GRAPH_TOOLS.has(name)
@@ -151,7 +172,7 @@ async function dispatchGraphTool(
 
     case "codebase_graph_query": {
       const filePath = args.filePath as string;
-      const graph = await getOrBuildGraph(projectPath);
+      const graph = await getGraphForRead(projectPath);
       const deps = getFileDependencies(graph, filePath);
 
       const lines = [`Dependencies for: ${filePath}\n`];
@@ -179,7 +200,7 @@ async function dispatchGraphTool(
     }
 
     case "codebase_graph_stats": {
-      const graph = await getOrBuildGraph(projectPath);
+      const graph = await getGraphForRead(projectPath);
 
       if (graph.nodes.length === 0) {
         return "No graph data available. Run codebase_graph_build first.";
@@ -222,7 +243,7 @@ async function dispatchGraphTool(
     }
 
     case "codebase_graph_circular": {
-      const graph = await getOrBuildGraph(projectPath);
+      const graph = await getGraphForRead(projectPath);
       const cycles = findCircularDependencies(graph);
 
       if (cycles.length === 0) {
@@ -241,7 +262,7 @@ async function dispatchGraphTool(
     }
 
     case "codebase_graph_visualize": {
-      const graph = await getOrBuildGraph(projectPath);
+      const graph = await getGraphForRead(projectPath);
 
       if (graph.nodes.length === 0) {
         return "No graph data available. Run codebase_graph_build first.";
@@ -526,7 +547,7 @@ async function dispatchGraphTool(
         try {
           // Build a fresh detection using the file graph + per-file payloads from the cache.
           // For efficiency we only list entry points by walking known symbols via the name index.
-          const fileGraph = await getOrBuildGraph(projectPath);
+          const fileGraph = await getGraphForRead(projectPath);
           const nameIndex = await cache.getNameIndex(readerToken);
           const seenFiles = new Set<string>();
           const payloads = [];

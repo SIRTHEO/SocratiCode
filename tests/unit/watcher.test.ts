@@ -89,6 +89,7 @@ import {
   isWatchedByAnyProcess,
   isWatching,
   startWatching,
+  startWatchingAutomatically,
   stopAllWatchers,
   stopWatching,
 } from "../../src/services/watcher.js";
@@ -103,6 +104,7 @@ const RESOLVED_PROJECT = path.resolve(TEST_PROJECT);
 describe("watcher (unit)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.SOCRATICODE_WATCHER;
     mockSubscribeCallback = null;
     mockAcquireProjectLock.mockResolvedValue(true);
     mockIsProjectLocked.mockResolvedValue(false);
@@ -116,11 +118,33 @@ describe("watcher (unit)", () => {
     // Clean up any active watchers between tests
     await stopAllWatchers();
     clearExternalWatchCache();
+    delete process.env.SOCRATICODE_WATCHER;
   });
 
   // ── startWatching / stopWatching / isWatching / getWatchedProjects ───
 
   describe("startWatching", () => {
+    it("refuses to start before acquiring a lock when watcher mode is off", async () => {
+      process.env.SOCRATICODE_WATCHER = "off";
+      const progress: string[] = [];
+
+      const result = await startWatching(TEST_PROJECT, (msg) => progress.push(msg));
+
+      expect(result).toBe(false);
+      expect(progress).toContain("File watcher disabled by SOCRATICODE_WATCHER=off");
+      expect(mockAcquireProjectLock).not.toHaveBeenCalled();
+      const watcher = await import("@parcel/watcher");
+      expect(watcher.default.subscribe).not.toHaveBeenCalled();
+    });
+
+    it("still permits an explicit start in manual mode", async () => {
+      process.env.SOCRATICODE_WATCHER = "manual";
+
+      await expect(startWatching(TEST_PROJECT)).resolves.toBe(true);
+
+      expect(isWatching(TEST_PROJECT)).toBe(true);
+    });
+
     it("starts watching and reports via onProgress", async () => {
       const progress: string[] = [];
       const result = await startWatching(TEST_PROJECT, (msg) => progress.push(msg));
@@ -1030,7 +1054,33 @@ describe("watcher (unit)", () => {
 
   // ── ensureWatcherStarted ───────────────────────────────────────────────
 
+  describe("startWatchingAutomatically", () => {
+    it("preserves automatic startup when the mode is unset", async () => {
+      await expect(startWatchingAutomatically(TEST_PROJECT)).resolves.toBe(true);
+      expect(isWatching(TEST_PROJECT)).toBe(true);
+    });
+
+    it.each(["manual", "off"])("does no watcher work in %s mode", async (mode) => {
+      process.env.SOCRATICODE_WATCHER = mode;
+
+      await expect(startWatchingAutomatically(TEST_PROJECT)).resolves.toBe(false);
+
+      expect(mockAcquireProjectLock).not.toHaveBeenCalled();
+      const watcher = await import("@parcel/watcher");
+      expect(watcher.default.subscribe).not.toHaveBeenCalled();
+    });
+  });
+
   describe("ensureWatcherStarted", () => {
+    it.each(["manual", "off"])("returns before storage access in %s mode", (mode) => {
+      process.env.SOCRATICODE_WATCHER = mode;
+
+      ensureWatcherStarted(TEST_PROJECT);
+
+      expect(mockGetCollectionInfo).not.toHaveBeenCalled();
+      expect(mockAcquireProjectLock).not.toHaveBeenCalled();
+    });
+
     it("does nothing if already watching", async () => {
       await startWatching(TEST_PROJECT);
       mockGetCollectionInfo.mockClear();
@@ -1250,6 +1300,13 @@ describe("watcher isIndexableFile — extensionless", () => {
     } catch {
       /* ignore */
     }
+  });
+
+  it("recognizes built-in Godot files with an empty legacy extension map", async () => {
+    const legacyExtensionMap = new Map<string, string>();
+    await expect(isIndexableFile(path.join(dir, "player.gd"), legacyExtensionMap)).resolves.toBe(true);
+    await expect(isIndexableFile(path.join(dir, "level.tscn"), legacyExtensionMap)).resolves.toBe(true);
+    await expect(isIndexableFile(path.join(dir, "material.tres"), legacyExtensionMap)).resolves.toBe(true);
   });
 
   it("treats a detected extensionless script as indexable", async () => {

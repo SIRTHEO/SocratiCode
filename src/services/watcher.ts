@@ -8,6 +8,7 @@ import watcher from "@parcel/watcher";
 import { collectionName, projectIdFromPath } from "../config.js";
 import {
   EXTENSION_LANGUAGE_MAP,
+  getWatcherMode,
   indexExtensionlessEnabled,
   SPECIAL_FILES,
   SUPPORTED_EXTENSIONS,
@@ -231,6 +232,13 @@ export async function startWatching(
   onProgress?: (message: string) => void,
 ): Promise<boolean> {
   const resolvedPath = path.resolve(projectPath);
+
+  if (getWatcherMode() === "off") {
+    const message = "File watcher disabled by SOCRATICODE_WATCHER=off";
+    onProgress?.(message);
+    logger.info(message, { projectPath: resolvedPath });
+    return false;
+  }
 
   if (subscriptions.has(resolvedPath)) {
     onProgress?.(`Already watching ${resolvedPath}`);
@@ -491,6 +499,19 @@ export async function startWatching(
   }
 }
 
+/**
+ * Start a watcher only when automatic watching is enabled. Manual mode keeps
+ * startWatching available to an explicit codebase_watch start request, while
+ * off mode is also enforced inside startWatching as a final safety boundary.
+ */
+export async function startWatchingAutomatically(
+  projectPath: string,
+  onProgress?: (message: string) => void,
+): Promise<boolean> {
+  if (getWatcherMode() !== "auto") return false;
+  return startWatching(projectPath, onProgress);
+}
+
 /** Stop watching a project directory */
 export async function stopWatching(projectPath: string): Promise<void> {
   const resolvedPath = path.resolve(projectPath);
@@ -560,6 +581,10 @@ export function clearExternalWatchCache(): void {
  */
 export function ensureWatcherStarted(projectPath: string): void {
   const resolvedPath = path.resolve(projectPath);
+
+  // Manual and off modes must not touch Qdrant, acquire the watch lock, or
+  // create a native subscription in response to an unrelated tool call.
+  if (getWatcherMode() !== "auto") return;
 
   // Already watching in this process — nothing to do
   if (subscriptions.has(resolvedPath)) return;

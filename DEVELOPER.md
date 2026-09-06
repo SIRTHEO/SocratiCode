@@ -196,7 +196,7 @@ src/
 │   ├── code-graph.ts        # AST-based code graph building via ast-grep
 │   ├── graph-analysis.ts    # Graph queries: dependencies, stats, cycles, Mermaid diagrams
 │   ├── graph-aliases.ts     # Path alias resolution from tsconfig/jsconfig compilerOptions.paths
-│   ├── graph-imports.ts     # Import/require/use extraction for 18+ languages via AST
+│   ├── graph-imports.ts     # Import/require/use extraction for 19+ languages via AST
 │   ├── graph-resolution.ts  # Module specifier → file path resolution (incl. aliases, SCSS partials)
 │   ├── graph-symbols.ts     # Per-language symbol & call-site extraction (Impact Analysis)
 │   ├── graph-symbol-resolution.ts  # Three-tier cross-file call-site resolution
@@ -249,6 +249,8 @@ All constants are defined in `src/constants.ts`:
 | `OLLAMA_CONTAINER_NAME` | `socraticode-ollama` | Docker container name |
 | `OLLAMA_IMAGE` | `ollama/ollama:latest` | Docker image |
 
+`getWatcherMode()` resolves `SOCRATICODE_WATCHER=auto|manual|off` at call time and rejects unknown values. `src/index.ts` invokes it during startup so invalid lifecycle configuration fails before tools are accepted.
+
 > **Note**: `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, and `EMBEDDING_CONTEXT_LENGTH` are defined in `src/services/embedding-config.ts`, not in `src/constants.ts`. Defaults are `nomic-embed-text` / `768` for Ollama, `text-embedding-3-small` / `1536` for OpenAI, and `gemini-embedding-001` / `3072` for Google.
 
 ### Embedding batch size
@@ -292,7 +294,7 @@ When `SOCRATICODE_BRANCH_AWARE=true`, the current git branch is detected via `gi
 
 `loadLinkedProjects()` reads `.socraticode.json` and `SOCRATICODE_LINKED_PROJECTS` env var. `resolveLinkedCollections()` maps linked paths to `{ name, label }` descriptors for `searchMultipleCollections()`. The current project is always first (highest dedup priority).
 
-### Supported File Extensions (55)
+### Supported File Extensions (63)
 
 | Category | Extensions |
 |----------|-----------|
@@ -312,9 +314,12 @@ When `SOCRATICODE_BRANCH_AWARE=true`, the current git branch is detected via `gi
 | Documentation | `.md`, `.mdx`, `.rst`, `.txt` |
 | SQL | `.sql` |
 | Dart | `.dart` |
+| Elixir | `.ex`, `.exs`, `.heex`, `.eex`, `.leex` |
 | Lua | `.lua` |
 | R | `.r`, `.R` |
 | Docker | `.dockerfile` |
+| GDScript (Godot) | `.gd` |
+| Godot Resources | `.tscn`, `.tres` |
 
 Special files always indexed: `Dockerfile`, `Makefile`, `Rakefile`, `Gemfile`, `Procfile`, `.env.example`, `.gitignore`, `.dockerignore`.
 
@@ -508,6 +513,7 @@ When `codebase_graph_build` is called:
    │   ├── Swift: import
    │   ├── Bash: source, . (dot)
    │   ├── Dart/Lua: regex-based extraction
+   │   ├── GDScript: preload()/load() (res://, uid://, relative paths), extends ClassName, extends "res://path.gd", extends "relative.gd"
    │   ├── Svelte/Vue: HTML parse → <script> extraction → re-parse as TypeScript
    │   ├── Svelte/Vue: HTML parse → <style> extraction → CSS @import/@require regex
    │   └── CSS/SCSS/SASS/LESS: @import/@import url()/@require regex extraction
@@ -823,17 +829,22 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 | `updateProjectIndex` | `(projectPath, onProgress?, extraExtensions?) → Promise<{ added, updated, removed, chunksCreated, cancelled }>` | Incremental update |
 | `removeProjectIndex` | `(projectPath) → Promise<void>` | Delete index, code graph, and context artifacts |
 
+### startup.ts
+
+`autoResumeIndexedProjects()` checks `SOCRATICODE_AUTO_RESUME=off` before Docker, Qdrant, explicit project lists, or any persisted-index access. Otherwise it preserves the existing current-project, explicit-list, and `all` modes. Watcher starts from startup pass through `startWatchingAutomatically`, so `manual` and `off` suppress the watcher without suppressing the catch-up update; combine watcher `off` with auto-resume `off` for a fully deliberate code-index snapshot.
+
 ### watcher.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `startWatching` | `(projectPath, onProgress?) → Promise<boolean>` | Start @parcel/watcher native subscription. Returns `true` if now watching (or already was), `false` if another process holds the lock or subscription failed |
+| `startWatching` | `(projectPath, onProgress?) → Promise<boolean>` | Start @parcel/watcher native subscription. Permitted in `auto` and `manual`, rejected before lock acquisition in `off`. Returns `true` if now watching (or already was), `false` if disabled, another process holds the lock, or subscription failed |
+| `startWatchingAutomatically` | `(projectPath, onProgress?) → Promise<boolean>` | Start only in `SOCRATICODE_WATCHER=auto`; shared guard for startup and post-index/update paths |
 | `stopWatching` | `(projectPath) → Promise<void>` | Stop watcher |
 | `stopAllWatchers` | `() → Promise<void>` | Stop all watchers |
 | `isWatching` | `(projectPath) → boolean` | Check if a project is being watched **by this process** |
 | `isWatchedByAnyProcess` | `(projectPath) → Promise<boolean>` | Cross-process check: local subscriptions first, then file-based lock |
 | `getWatchedProjects` | `() → string[]` | List watched paths |
-| `ensureWatcherStarted` | `(projectPath) → void` | Fire-and-forget auto-start with TTL cache: checks not watching, not externally watched (60s cache), not indexing, collection exists |
+| `ensureWatcherStarted` | `(projectPath) → void` | Fire-and-forget auto-start in `auto` mode with TTL cache: checks not watching, not externally watched (60s cache), not indexing, collection exists. Returns before storage access in `manual`/`off` |
 | `clearExternalWatchCache` | `() → void` | Clear the external watch TTL cache (for testing) |
 
 Watcher settings:
@@ -843,13 +854,16 @@ Watcher settings:
 - Auto-stops after 10 consecutive errors
 - Cross-process lock prevents duplicate watchers
 - Cross-process status awareness: `codebase_status` and `codebase_search` detect watchers running in other MCP processes via file-based locks
-- Auto-starts on first tool interaction with an indexed project (search, status, update, graph), with 60-second TTL cache to avoid retrying when another process holds the lock
+- Auto-starts on first tool interaction with an indexed project (search, status, update, graph) only in `auto`, with 60-second TTL cache to avoid retrying when another process holds the lock
+- `manual` disables every automatic watcher start but leaves explicit `codebase_watch start` available; `off` rejects explicit starts too
+- Watcher mode is process-local. Every MCP process sharing a checkout must use the same snapshot setting; status warns when an `off` process detects another watcher
 
 ### code-graph.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `buildCodeGraph` | `(projectPath, extraExtensions?, progress?) → Promise<CodeGraph>` | Build dependency graph via ast-grep with optional progress tracking |
+| `getExistingGraph` | `(projectPath) → Promise<CodeGraph \| null>` | Load a cached or persisted graph without creating one |
 | `getOrBuildGraph` | `(projectPath, extraExtensions?) → Promise<CodeGraph>` | Get cached graph or build new one |
 | `rebuildGraph` | `(projectPath, extraExtensions?) → Promise<CodeGraph>` | Force rebuild with concurrency guard (joins existing build if in progress) |
 | `invalidateGraphCache` | `(projectPath) → void` | Clear cached graph for project |
@@ -1009,13 +1023,15 @@ npx tsx scripts/benchmark-graph.ts /absolute/path/to/repo
 |----------|-----------|-------------|
 | `extractImports` | `(source, lang, ext) → ImportInfo[]` | Extract imports from source using ast-grep AST patterns |
 
-Supports 18+ languages including TypeScript, JavaScript, Python, Java, Kotlin, Go, Rust, Ruby, PHP, C, C++, C#, Swift, Scala, Bash, Dart, and Lua.
+Supports 19+ languages including TypeScript, JavaScript, Python, Java, Kotlin, Go, Rust, Ruby, PHP, C, C++, C#, Swift, Scala, Bash, Dart, Lua, and GDScript.
+
+**GDScript (Godot) support is conditional**: the `tree-sitter-gdscript` native addon is an optional dependency resolved via `node-gyp-build`. A preflight check in an isolated child process (`gdscript-preflight.cjs`) validates the addon's N-API compatibility, ast-grep registration symbol, and parse capability before registration. When the preflight passes, AST-based extraction avoids false matches in comments and strings. When it fails, a lightweight lexer provides syntax-aware preload/load/extends extraction and line-based chunking without treating comments or strings as code. Relative `extends` and `preload` paths resolve from the script directory; relative runtime `load` paths resolve from the Godot project root. Godot resource files (`.tscn`/`.tres`) use a tokenizer-based extractor that handles arbitrary whitespace, attribute order, and `uid://` paths. See the [TSCN file format docs](https://docs.godotengine.org/en/stable/engine_details/file_formats/tscn.html) for the resource format specification.
 
 ### graph-resolution.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `resolveImport` | `(specifier, sourceFile, projectPath, fileSet, language, aliases?, jvmSuffixMap?, csNamespaceMap?, goModuleInfo?, phpPsr4Map?, dartPackageMap?, pythonImportRoots?, elixirModuleMap?, phpFqcnMap?) → string \| null` | Resolve a module specifier to a project-relative file path; null for external/stdlib modules or a resolution miss |
+| `resolveImport` | `(specifier, sourceFile, projectPath, fileSet, language, aliases?, jvmSuffixMap?, csNamespaceMap?, goModuleInfo?, phpPsr4Map?, dartPackageMap?, pythonImportRoots?, elixirModuleMap?, phpFqcnMap?, rustCrates?, rustDeclaredMods?, rustIsDeclaration?, classNameIndex?, godotProjectRoot?, godotUidIndex?, fallbackSpecifier?, godotImportKind?) → string \| null` | Resolve a module specifier to a project-relative file path; null for external/stdlib modules or a resolution miss |
 | `buildJvmSuffixMap` | `(fileSet) → Map<string, string>` | Java/Kotlin/Scala: class-name suffix → file, for multi-module source layouts |
 | `buildCsNamespaceMap` | `(fileSet, projectPath) → Map<string, string[]>` | C#: `namespace X.Y` declarations → contributing files, resolving `using` directives |
 | `buildGoModuleInfo` | `(fileSet, projectPath) → GoModuleInfo[]` | Go: one entry per `go.mod` (root and nested), package dir → representative file |
@@ -1026,6 +1042,11 @@ Supports 18+ languages including TypeScript, JavaScript, Python, Java, Kotlin, G
 | `pythonRootsForFile` | `(manifests, relSourceDir) → string[]` | Python: the import roots that apply to one file, ancestry- and membership-scoped, nearest first |
 | `buildElixirModuleMap` | `(fileSet, projectPath) → Map<string, string[]>` | Elixir: `defmodule` name → declaring files (AST-derived), resolving `alias`/`import`/`require`/`use` |
 | `hasLiteralShellPathShape` | `(specifier) → boolean` | Shell: whether a `source` argument is a literal path worth resolving |
+| `buildClassNameIndex` | `(projectPath, fileSet) → ClassNameIndex` | GDScript: legacy global class_name index retained for compatibility; use `buildGodotProjectIndexes` for project-scoped resolution |
+| `buildGodotProjectIndexes` | `(projectPath, fileSet, rootCache?) → GodotProjectIndexes` | GDScript: per-project class_name indexes, keyed by Godot project root |
+| `buildGodotUidIndexes` | `(projectPath, fileSet, rootCache?) → GodotProjectUidIndexes` | GDScript: per-project uid:// → relative path index, from .uid sidecars and .tscn/.tres headers |
+| `findGodotProjectRootForProject` | `(projectPath) → string \| null` | GDScript: find Godot project root (directory containing project.godot) |
+| `findGodotRootForFile` | `(sourceFile, godotProjectIndexes?, rootCache?) → string \| null` | GDScript: find nearest project.godot ancestor for a single file |
 
 The `GoModuleInfo` and `PythonManifest` interfaces are exported alongside their builders.
 
@@ -1129,6 +1150,8 @@ Parameters:
 
 Returns: Status message or list of watched projects
 ```
+
+`SOCRATICODE_WATCHER=manual` suppresses automatic starts but permits the `start` action. `off` rejects `start` before infrastructure or catch-up work and reports the watcher as disabled. `stop` remains available in all modes. Use `SOCRATICODE_AUTO_RESUME=off` as well when startup must not run an incremental catch-up or resume interrupted indexing.
 
 ### Query Tools
 
@@ -1606,7 +1629,7 @@ publishes matching integration metadata.
   registered MCP server. The extension is a thin distribution and UI
   shell.
 - It does **not** ship its own copy of the engine. The engine launches
-  via `npx -y socraticode` (configurable via the `socraticode.command` /
+  via `npx -y --prefer-online socraticode@latest` (configurable via the `socraticode.command` /
   `socraticode.args` settings).
 - It does **not** add language-server features (code lenses, hovers,
   diagnostics). Those would conflict with the host editor's existing
@@ -1638,7 +1661,7 @@ Make sure the project has been indexed first (`codebase_index`). Check the statu
 
 ### Code graph returns empty
 
-The code graph uses ast-grep for AST-based import extraction. It works for 18+ languages. If a file has no recognised imports (or uses non-standard import patterns), it may appear as an orphan node.
+The code graph uses ast-grep for AST-based import extraction. It works for 19+ languages. If a file has no recognised imports (or uses non-standard import patterns), it may appear as an orphan node.
 
 ### Large codebase is slow to index
 
