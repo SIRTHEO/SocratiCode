@@ -2,9 +2,10 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { buildCodeGraph, ensureDynamicLanguages, gdscriptParserAvailable, getDynamicLanguageStatus } from "../../src/services/code-graph.js";
 import { decodeGdscriptString, extractGdscriptImportsRegex, extractGodotResourceImports, extractImports, parseTscnSectionHeader } from "../../src/services/graph-imports.js";
 import {
@@ -15,11 +16,10 @@ import {
   findGodotRootForFile,
   resolveImport,
 } from "../../src/services/graph-resolution.js";
+import { chunkFileContent } from "../../src/services/indexer.js";
 
-// Register dynamic language grammars once before all tests
-beforeAll(() => {
-  ensureDynamicLanguages();
-});
+// Register before test declarations so skipIf observes the final availability state.
+ensureDynamicLanguages();
 
 // Track temp dirs for cleanup after all tests
 const tempDirs: string[] = [];
@@ -80,6 +80,7 @@ func _ready():
       expect(
         loadImports.some((i) => i.moduleSpecifier === "res://scenes/Main.tscn"),
       ).toBe(true);
+      expect(loadImports.find((i) => i.moduleSpecifier === "res://scenes/Main.tscn")?.godotImportKind).toBe("load");
     });
 
     it("extracts extends ClassName as class: prefixed references", () => {
@@ -1178,6 +1179,24 @@ func setup():
       expect(loaded.has("java")).toBe(true);
     });
 
+    it("uses AST boundaries when available and line chunks otherwise", () => {
+      const lines = [
+        "extends Node",
+        "",
+        "func first():",
+        ...Array.from({ length: 57 }, (_, index) => `    var first_${index} = ${index}`),
+        "",
+        "func second():",
+        ...Array.from({ length: 57 }, (_, index) => `    var second_${index} = ${index}`),
+      ];
+      const chunks = chunkFileContent("/tmp/main.gd", "main.gd", lines.join("\n"));
+
+      expect(chunks.every((chunk) => chunk.language === "gdscript")).toBe(true);
+      expect(chunks.map((chunk) => chunk.startLine)).toEqual(
+        gdscriptParserAvailable ? [1, 2, 61] : [1, 91],
+      );
+    });
+
     it.skipIf(!gdscriptParserAvailable)("AST-based import extraction works when parser is available", () => {
       // This test verifies that the AST path is actually used (not just regex
       // fallback). The AST path correctly skips comments and strings.
@@ -1199,9 +1218,7 @@ func setup():
       expect(specs).toContain("res://scripts/Real.gd");
     });
 
-    it("regex fallback extracts preload/load when native parser is unavailable", () => {
-      // When gdscriptParserAvailable is false, the regex fallback should still
-      // extract preload/load and extends imports.
+    it("parser-independent fallback extracts preload/load and extends", () => {
       const source = [
         'extends "res://scripts/Base.gd"',
         '',
@@ -1209,7 +1226,7 @@ func setup():
         '    preload("res://scripts/Helper.gd")',
       ].join('\n');
 
-      const imports = extractImports(source, "gdscript", ".gd");
+      const imports = extractGdscriptImportsRegex(source);
       const specs = imports.map((i) => i.moduleSpecifier);
       expect(specs).toContain("res://scripts/Base.gd");
       expect(specs).toContain("res://scripts/Helper.gd");
@@ -1220,7 +1237,7 @@ func setup():
   //
   // These tests exercise the preflight child-process validation directly,
   // since ensureDynamicLanguages is a one-shot function that has already
-  // run in beforeAll. The preflight script validates the native addon in
+  // run during module setup. The preflight script validates the native addon in
   // isolation: N-API load, export check, and ast-grep parse.
 
   describe("GDScript preflight validation", () => {
@@ -1251,6 +1268,49 @@ func setup():
           stderr: (e.stderr ?? "").trim(),
         };
       }
+    }
+
+    /** Copy node-gyp-build into a fake package to exercise package-local resolution. */
+    function installNodeGypBuild(fakeRoot: string): void {
+      const gdscriptPackage = require.resolve("tree-sitter-gdscript/package.json");
+      const gdscriptRequire = createRequire(gdscriptPackage);
+      const sourceRoot = path.dirname(gdscriptRequire.resolve("node-gyp-build/package.json"));
+      const targetRoot = path.join(fakeRoot, "node_modules", "node-gyp-build");
+      fs.mkdirSync(path.dirname(targetRoot), { recursive: true });
+      fs.cpSync(sourceRoot, targetRoot, { recursive: true });
+    }
+
+    /** Find a loadable non-GDScript addon for the missing-export regression. */
+    function findNativeAddon(root: string): string | null {
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        const entryPath = path.join(root, entry.name);
+        if (entry.isDirectory()) {
+          const nested = findNativeAddon(entryPath);
+          if (nested) return nested;
+        } else if (entry.name.endsWith(".node")) {
+          return entryPath;
+        }
+      }
+      return null;
+    }
+
+    /** Resolve ast-grep's installed platform package without assuming npm hoisting. */
+    function findAstGrepNativeAddon(): string | null {
+      const napiPackage = require.resolve("@ast-grep/napi/package.json");
+      const napiRequire = createRequire(napiPackage);
+      const manifest = JSON.parse(fs.readFileSync(napiPackage, "utf-8")) as {
+        optionalDependencies?: Record<string, string>;
+      };
+      for (const packageName of Object.keys(manifest.optionalDependencies ?? {})) {
+        try {
+          const platformPackage = napiRequire.resolve(`${packageName}/package.json`);
+          const addon = findNativeAddon(path.dirname(platformPackage));
+          if (addon) return addon;
+        } catch {
+          // This optional platform package is not installed on the current host.
+        }
+      }
+      return null;
     }
 
     it.skipIf(!gdscriptParserAvailable)("passes for the packaged prebuild in the current environment", () => {
@@ -1284,6 +1344,7 @@ func setup():
           dependencies: { "node-gyp-build": "^4.8.4" },
         }),
       );
+      installNodeGypBuild(fakeRoot);
 
       // Create prebuilds dir with a corrupt .node file (just text)
       const prebuildDir = path.join(fakeRoot, "prebuilds", `${process.platform}-${process.arch}`);
@@ -1295,19 +1356,10 @@ func setup():
 
       const result = runPreflight(path.join(fakeRoot, "package.json"));
       expect(result.exitCode).not.toBe(0);
-      // The error should be about loading the native addon
-      expect(result.stderr).toContain("PREFLIGHT:");
+      expect(result.stderr).toContain("PREFLIGHT: require() of native addon failed:");
     });
 
-    it("fails for a .node file with wrong ABI (missing expected export)", () => {
-      // Create a fake package with a .node file that loads but doesn't
-      // export the expected `language` object. We use a real .node file
-      // from a different native addon (if available) or create a minimal
-      // N-API addon that exports the wrong thing.
-      //
-      // Since creating a real N-API addon in a test is impractical, we
-      // test the missing-export path by creating a package with no
-      // prebuilds at all — node-gyp-build.path() will throw.
+    it("fails when a loadable native addon lacks the language export", () => {
       const fakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-no-prebuild-"));
       tempDirs.push(fakeRoot);
 
@@ -1319,11 +1371,43 @@ func setup():
           dependencies: { "node-gyp-build": "^4.8.4" },
         }),
       );
+      installNodeGypBuild(fakeRoot);
 
-      // No prebuilds/ and no build/Release/ — node-gyp-build.path() throws
+      const unrelatedAddon = findAstGrepNativeAddon();
+      expect(unrelatedAddon).not.toBeNull();
+      const prebuildDir = path.join(fakeRoot, "prebuilds", `${process.platform}-${process.arch}`);
+      fs.mkdirSync(prebuildDir, { recursive: true });
+      fs.copyFileSync(unrelatedAddon as string, path.join(prebuildDir, "unrelated.node"));
+
       const result = runPreflight(path.join(fakeRoot, "package.json"));
       expect(result.exitCode).not.toBe(0);
-      expect(result.stderr).toContain("PREFLIGHT:");
+      expect(result.stderr).toContain("PREFLIGHT: native addon does not export a language object");
+    });
+
+    it.skipIf(!gdscriptParserAvailable)("accepts a source-built artifact under build/Release", () => {
+      const fakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-source-build-"));
+      tempDirs.push(fakeRoot);
+      fs.writeFileSync(
+        path.join(fakeRoot, "package.json"),
+        JSON.stringify({
+          name: "tree-sitter-gdscript",
+          version: "0.0.0",
+          dependencies: { "node-gyp-build": "^4.8.4" },
+        }),
+      );
+      installNodeGypBuild(fakeRoot);
+
+      const realPackage = require.resolve("tree-sitter-gdscript/package.json");
+      const gdscriptRequire = createRequire(realPackage);
+      const nodeGypBuild = gdscriptRequire("node-gyp-build") as { path(root: string): string };
+      const realAddon = nodeGypBuild.path(path.dirname(realPackage));
+      const releaseDir = path.join(fakeRoot, "build", "Release");
+      fs.mkdirSync(releaseDir, { recursive: true });
+      fs.copyFileSync(realAddon, path.join(releaseDir, "tree-sitter-gdscript.node"));
+
+      const result = runPreflight(path.join(fakeRoot, "package.json"));
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toMatch(/^PREFLIGHT: OK /);
     });
 
     it("unrelated grammars remain loaded when GDScript preflight fails", () => {
@@ -1909,6 +1993,35 @@ func setup():
       expect(specs).toContain("res://scripts/Real.gd");
     });
 
+    it("ignores inline comments, ordinary strings, member calls, and nested arguments", () => {
+      const source = [
+        'extends Node # preload("res://inline-comment.gd")',
+        'var text = "load(\\"res://quoted.gd\\")"',
+        'var member = ResourceLoader.load("res://member.gd")',
+        'var nested = load(resolve_path("res://nested.gd"))',
+        'var real = preload("res://real.gd")',
+      ].join("\n");
+      const specs = extractGdscriptImportsRegex(source).map((item) => item.moduleSpecifier);
+
+      expect(specs).toContain("res://real.gd");
+      expect(specs).not.toContain("res://inline-comment.gd");
+      expect(specs).not.toContain("res://quoted.gd");
+      expect(specs).not.toContain("res://member.gd");
+      expect(specs).not.toContain("res://nested.gd");
+    });
+
+    it("records the construct that controls relative-path resolution", () => {
+      const imports = extractGdscriptImportsRegex([
+        'extends "base.gd"',
+        'var eager = preload("helper.gd")',
+        'var runtime = load("resource.tres")',
+      ].join("\n"));
+
+      expect(imports.find((item) => item.moduleSpecifier === "base.gd")?.godotImportKind).toBe("extends");
+      expect(imports.find((item) => item.moduleSpecifier === "helper.gd")?.godotImportKind).toBe("preload");
+      expect(imports.find((item) => item.moduleSpecifier === "resource.tres")?.godotImportKind).toBe("load");
+    });
+
     it("accepts lowercase class names in extends", () => {
       const source = 'extends myClass\n\nfunc _ready(): pass\n';
       const imports = extractGdscriptImportsRegex(source);
@@ -1982,6 +2095,31 @@ func setup():
       const index = buildClassNameIndex(root, fileSet);
       expect(index.get("myClass")).toBe("scripts/lower.gd");
     });
+
+    it("ignores class_name text inside ordinary strings and after inline comments", () => {
+      const { root } = makeGodotProject({
+        "scripts/real.gd": [
+          'var text = "class_name Phantom"',
+          'var hash = "# class_name AlsoPhantom"',
+          'var value = 1 # class_name CommentedOut',
+          "class_name RealClass",
+        ].join("\n"),
+      });
+      const index = buildClassNameIndex(root, new Set(["scripts/real.gd"]));
+
+      expect(index.get("RealClass")).toBe("scripts/real.gd");
+      expect(index.has("Phantom")).toBe(false);
+      expect(index.has("AlsoPhantom")).toBe(false);
+      expect(index.has("CommentedOut")).toBe(false);
+    });
+
+    it("recognizes Unicode identifiers in the parser-independent class index", () => {
+      const { root } = makeGodotProject({
+        "scripts/unicode.gd": "class_name Éclaireur\nextends Node\n",
+      });
+      const index = buildClassNameIndex(root, new Set(["scripts/unicode.gd"]));
+      expect(index.get("Éclaireur")).toBe("scripts/unicode.gd");
+    });
   });
 
   // ── UID resolution ─────────────────────────────────────────────────────
@@ -1999,6 +2137,40 @@ func setup():
       for (const [, index] of indexes) {
         expect(index.get("uid://abc123")).toBe("scripts/Player.gd");
       }
+    });
+
+    it("uses .uid metadata without creating a graph node for the sidecar", async () => {
+      const { root } = makeGodotProject({
+        "project.godot": "[application]\n",
+        "scripts/Player.gd": "extends Node\n",
+        "scripts/Player.gd.uid": "uid://abc123\n",
+        "scripts/User.gd": [
+          "extends Node",
+          'var player = preload("uid://abc123")',
+          'var metadata = preload("res://scripts/Player.gd.uid")',
+        ].join("\n"),
+      });
+
+      const graph = await buildCodeGraph(root);
+      const userNode = graph.nodes.find((node) => node.relativePath === "scripts/User.gd");
+
+      expect(userNode?.dependencies).toContain("scripts/Player.gd");
+      expect(userNode?.dependencies).not.toContain("scripts/Player.gd.uid");
+      expect(graph.nodes.some((node) => node.relativePath.endsWith(".uid"))).toBe(false);
+    });
+
+    it("does not create a phantom target from a stale .uid sidecar", async () => {
+      const { root } = makeGodotProject({
+        "project.godot": "[application]\n",
+        "scripts/Missing.gd.uid": "uid://stale123\n",
+        "scripts/User.gd": 'extends Node\nvar missing = preload("uid://stale123")\n',
+      });
+
+      const graph = await buildCodeGraph(root);
+      const userNode = graph.nodes.find((node) => node.relativePath === "scripts/User.gd");
+
+      expect(userNode?.dependencies).not.toContain("scripts/Missing.gd");
+      expect(graph.nodes.some((node) => node.relativePath === "scripts/Missing.gd")).toBe(false);
     });
 
     it("buildGodotUidIndexes builds index from .tscn file headers", () => {
@@ -2094,6 +2266,25 @@ func setup():
   // ── Relative path resolution ───────────────────────────────────────────
 
   describe("relative path resolution", () => {
+    it("uses script-relative paths for preload and project-relative paths for load", async () => {
+      const { root } = makeGodotProject({
+        "project.godot": "[application]\n",
+        "helper.gd": "extends Node\n",
+        "scripts/helper.gd": "extends Node\n",
+        "scripts/main.gd": [
+          "extends Node",
+          'var eager = preload("helper.gd")',
+          'var runtime = load("helper.gd")',
+        ].join("\n"),
+      });
+
+      const graph = await buildCodeGraph(root);
+      const mainNode = graph.nodes.find((node) => node.relativePath === "scripts/main.gd");
+
+      expect(mainNode?.dependencies).toContain("scripts/helper.gd");
+      expect(mainNode?.dependencies).toContain("helper.gd");
+    });
+
     it("resolves relative extends path from script directory", () => {
       const { root, resolve } = makeGodotProject({
         "project.godot": "",

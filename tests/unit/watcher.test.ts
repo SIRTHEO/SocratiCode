@@ -1252,6 +1252,13 @@ describe("watcher isIndexableFile — extensionless", () => {
     }
   });
 
+  it("recognizes built-in Godot files with an empty legacy extension map", async () => {
+    const legacyExtensionMap = new Map<string, string>();
+    await expect(isIndexableFile(path.join(dir, "player.gd"), legacyExtensionMap)).resolves.toBe(true);
+    await expect(isIndexableFile(path.join(dir, "level.tscn"), legacyExtensionMap)).resolves.toBe(true);
+    await expect(isIndexableFile(path.join(dir, "material.tres"), legacyExtensionMap)).resolves.toBe(true);
+  });
+
   it("treats a detected extensionless script as indexable", async () => {
     const p = path.join(dir, "strato-check-x");
     fs.writeFileSync(p, "#!/bin/bash\nexit 0\n");

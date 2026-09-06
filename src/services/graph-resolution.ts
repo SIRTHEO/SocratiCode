@@ -4,6 +4,7 @@ import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "no
 import path from "node:path";
 import { parse as parseToml, type TomlTable, type TomlValue } from "smol-toml";
 import { toForwardSlash } from "../constants.js";
+import { extractClassNameFromGdscript } from "./gdscript-syntax.js";
 import type { PathAliases } from "./graph-aliases.js";
 import { extractSymbolsAndCalls } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -2259,44 +2260,6 @@ export type ClassNameIndex = Map<string, string>;
  * resolveImport can do O(1) class-name lookups instead of re-reading every
  * .gd file for each extends statement.
  */
-/**
- * Extract a class_name declaration from GDScript source, excluding
- * comments and string bodies.
- *
- * GDScript permits same-line annotations before class_name:
- *   @abstract class_name AbstractClass
- *   @tool class_name MyClass extends Node
- *
- * The regex matches `class_name` preceded by start-of-line, whitespace,
- * or annotation tokens — not inside a comment (#) or string literal.
- * Triple-quoted strings are excluded by stripping them before matching.
- *
- * The tree-sitter-gdscript@6.1.0 grammar limits identifiers to ASCII,
- * so \w (ASCII word chars) is correct for the grammar's actual behavior.
- * Unicode identifier support would require an upstream grammar change.
- *
- * Returns the class name string, or null if the file has no class_name.
- */
-function extractClassNameFromGdscript(content: string): string | null {
-  // Strip triple-quoted strings ("""...""" or '''...''') so a
-  // `class_name Phantom` inside a multiline string is not registered.
-  // Also strip # comments so a commented-out declaration is not registered.
-  const stripped = content
-    .replace(/"""[\s\S]*?"""/g, "")
-    .replace(/'''[\s\S]*?'''/g, "")
-    .replace(/#[^\n]*/g, "");
-
-  // Match class_name preceded by start-of-line, whitespace, or an
-  // annotation (@...). This catches:
-  //   class_name Foo
-  //   @tool class_name Foo
-  //   @abstract class_name Foo extends Bar
-  // The \w+ captures the class name (ASCII identifiers, matching the
-  // tree-sitter-gdscript grammar's actual identifier rules).
-  const match = stripped.match(/(?:^|[\s@])class_name\s+([A-Za-z_]\w*)/m);
-  return match ? match[1] : null;
-}
-
 export function buildClassNameIndex(
   projectPath: string,
   fileSet: Set<string>,
@@ -2342,6 +2305,8 @@ export type GodotProjectIndexes = Map<string, ClassNameIndex>;
  */
 export type GodotUidIndex = Map<string, string>;
 export type GodotProjectUidIndexes = Map<string, GodotUidIndex>;
+/** Per-graph-build cache for nearest project.godot lookups. */
+export type GodotRootCache = Map<string, string | null>;
 
 /**
  * Build per-Godot-project UID indexes from `.uid` sidecar files and
@@ -2359,6 +2324,7 @@ export type GodotProjectUidIndexes = Map<string, GodotUidIndex>;
 export function buildGodotUidIndexes(
   projectPath: string,
   fileSet: Set<string>,
+  rootCache: GodotRootCache = new Map(),
 ): GodotProjectUidIndexes {
   const indexes: GodotProjectUidIndexes = new Map();
 
@@ -2366,7 +2332,7 @@ export function buildGodotUidIndexes(
     // .uid sidecar files: <file>.uid contains a single line "uid://..."
     if (relPath.endsWith(".uid")) {
       const absPath = path.join(projectPath, relPath);
-      const godotRoot = walkUpForGodotProject(path.dirname(absPath));
+      const godotRoot = walkUpForGodotProject(path.dirname(absPath), rootCache);
       if (!godotRoot) continue;
 
       let index = indexes.get(godotRoot);
@@ -2380,7 +2346,8 @@ export function buildGodotUidIndexes(
         if (content.startsWith("uid://")) {
           // The resource file is the .uid path without the .uid suffix
           const resourcePath = relPath.slice(0, -4); // strip ".uid"
-          index.set(content, resourcePath);
+          // A stale sidecar must not create a graph node for a missing file.
+          if (fileSet.has(resourcePath)) index.set(content, resourcePath);
         }
       } catch {
         // Skip unreadable files
@@ -2391,7 +2358,7 @@ export function buildGodotUidIndexes(
     // .tscn/.tres files: parse uid="uid://..." from the file header
     if (relPath.endsWith(".tscn") || relPath.endsWith(".tres")) {
       const absPath = path.join(projectPath, relPath);
-      const godotRoot = walkUpForGodotProject(path.dirname(absPath));
+      const godotRoot = walkUpForGodotProject(path.dirname(absPath), rootCache);
       if (!godotRoot) continue;
 
       let index = indexes.get(godotRoot);
@@ -2431,6 +2398,7 @@ export function buildGodotUidIndexes(
 export function buildGodotProjectIndexes(
   projectPath: string,
   fileSet: Set<string>,
+  rootCache: GodotRootCache = new Map(),
 ): GodotProjectIndexes {
   const indexes: GodotProjectIndexes = new Map();
 
@@ -2445,7 +2413,7 @@ export function buildGodotProjectIndexes(
     if (!isGd && !isResource) continue;
 
     const absPath = path.join(projectPath, relPath);
-    const godotRoot = walkUpForGodotProject(path.dirname(absPath));
+    const godotRoot = walkUpForGodotProject(path.dirname(absPath), rootCache);
     if (!godotRoot) continue;
 
     // Ensure this project root is in the map (even if the file has no
@@ -2482,11 +2450,13 @@ export function buildGodotProjectIndexes(
  * support repositories with multiple Godot projects.
  *
  * @param sourceFile - Absolute path to the source file
- * @param godotProjectIndexes - Pre-built indexes (used as a cache of known roots)
+ * @param godotProjectIndexes - Retained for compatibility with existing callers.
+ * @param rootCache - Optional cache scoped to one graph build.
  */
 export function findGodotRootForFile(
   sourceFile: string,
-  godotProjectIndexes?: GodotProjectIndexes,
+  _godotProjectIndexes?: GodotProjectIndexes,
+  rootCache: GodotRootCache = new Map(),
 ): string | null {
   // Always walk the filesystem from the file's directory to find the
   // NEAREST project.godot. This is critical for nested projects:
@@ -2504,7 +2474,7 @@ export function findGodotRootForFile(
   //
   // The filesystem walk is cheap (stat calls walking up from the file's
   // directory, typically 1-3 hops) and guarantees correctness.
-  return walkUpForGodotProject(path.dirname(sourceFile));
+  return walkUpForGodotProject(path.dirname(sourceFile), rootCache);
 }
 
 /**
@@ -2525,6 +2495,9 @@ export function findGodotRootForFile(
  * @param godotUidIndex - Pre-built UID → relative path index for uid:// resolution.
  *   When provided, uid:// paths are resolved via this index. When absent,
  *   uid:// paths cannot be resolved and return null.
+ * @param fallbackSpecifier - Optional path fallback for a primary uid:// specifier.
+ * @param godotImportKind - GDScript construct that supplied the path. Runtime
+ *   load paths use the Godot project root; extends and preload use the source directory.
  */
 export function resolveImport(
   moduleSpecifier: string,
@@ -2548,6 +2521,7 @@ export function resolveImport(
   godotProjectRoot?: string | null,
   godotUidIndex?: GodotUidIndex,
   fallbackSpecifier?: string,
+  godotImportKind?: "extends" | "preload" | "load",
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -2977,6 +2951,7 @@ export function resolveImport(
             elixirModuleMap, phpFqcnMap,
             rustCrates, rustDeclaredMods, rustIsDeclaration,
             classNameIndex, godotProjectRoot, godotUidIndex,
+            undefined, godotImportKind,
           );
         }
         // Without a UID index or fallback, uid:// paths cannot be resolved
@@ -2985,6 +2960,7 @@ export function resolveImport(
       // preload/load: res://path/to/file.gd → resolve relative to Godot project root
       if (moduleSpecifier.startsWith("res://")) {
         const resPath = moduleSpecifier.slice("res://".length);
+        if (resPath.endsWith(".uid")) return null;
         // Use pre-resolved root if available; fall back to filesystem walk for ad-hoc calls
         const godotRoot = godotProjectRoot !== undefined ? godotProjectRoot : findGodotProjectRoot(sourceFile);
         // Do NOT fall back to projectPath when no Godot root is found.
@@ -2999,14 +2975,19 @@ export function resolveImport(
         // when the .png is not in the project file set.
         return resolveRelativePath(resPath, godotRoot, projectPath, fileSet, []);
       }
-      // Relative paths (extends "base.gd", preload("helper.gd"))
-      // These resolve relative to the current script's directory.
-      // Per the GDScript reference, extends and preload accept paths
-      // relative to the script's own location.
+      // Relative extends/preload paths use the script directory. Runtime
+      // load() paths are localized by ResourceLoader against the res:// root.
+      // Callers predating godotImportKind retain the previous source-relative
+      // behavior, preserving the public resolver helper's compatibility.
       // Exclude class: prefixed specifiers and scheme:// paths.
       if (!path.isAbsolute(moduleSpecifier) && !moduleSpecifier.includes("://") && !moduleSpecifier.startsWith("class:")) {
-        const sourceDir = path.dirname(sourceFile);
-        return resolveRelativePath(moduleSpecifier, sourceDir, projectPath, fileSet, []);
+        if (moduleSpecifier.endsWith(".uid")) return null;
+        if (godotImportKind === "load") {
+          const godotRoot = godotProjectRoot !== undefined ? godotProjectRoot : findGodotProjectRoot(sourceFile);
+          if (!godotRoot) return null;
+          return resolveRelativePath(moduleSpecifier, godotRoot, projectPath, fileSet, []);
+        }
+        return resolveRelativePath(moduleSpecifier, path.dirname(sourceFile), projectPath, fileSet, []);
       }
       // extends ClassName → resolve via class_name convention
       // The import extractor prefixes class-name references with "class:"
@@ -3048,6 +3029,7 @@ export function resolveImport(
       // declarations with res:// paths or relative paths.
       if (moduleSpecifier.startsWith("res://")) {
         const resPath = moduleSpecifier.slice("res://".length);
+        if (resPath.endsWith(".uid")) return null;
         const godotRoot = godotProjectRoot !== undefined ? godotProjectRoot : findGodotProjectRoot(sourceFile);
         // Do NOT fall back to projectPath — res:// is Godot-specific.
         if (!godotRoot) return null;
@@ -3056,6 +3038,7 @@ export function resolveImport(
       // Relative path (e.g. "material.tres") — resolve relative to the
       // directory containing the .tscn/.tres file, per Godot TSCN docs.
       if (!path.isAbsolute(moduleSpecifier)) {
+        if (moduleSpecifier.endsWith(".uid")) return null;
         const sourceDir = path.dirname(sourceFile);
         return resolveRelativePath(moduleSpecifier, sourceDir, projectPath, fileSet, []);
       }
@@ -3270,12 +3253,22 @@ function resolveRelativePath(
  * found within 50 levels or at the filesystem root. Shared by both
  * {@link findGodotProjectRootForProject} and {@link findGodotProjectRoot}.
  */
-function walkUpForGodotProject(startDir: string): string | null {
-  let dir = startDir;
+function walkUpForGodotProject(startDir: string, rootCache?: GodotRootCache): string | null {
+  let dir = path.resolve(startDir);
+  const visited: string[] = [];
   for (let i = 0; i < 50; i++) {
+    if (rootCache?.has(dir)) {
+      const cached = rootCache.get(dir) ?? null;
+      for (const visitedDir of visited) rootCache.set(visitedDir, cached);
+      return cached;
+    }
+    visited.push(dir);
     const godotProject = path.join(dir, "project.godot");
     try {
-      if (existsSync(godotProject)) return dir;
+      if (existsSync(godotProject)) {
+        for (const visitedDir of visited) rootCache?.set(visitedDir, dir);
+        return dir;
+      }
     } catch {
       // Ignore stat errors
     }
@@ -3283,6 +3276,7 @@ function walkUpForGodotProject(startDir: string): string | null {
     if (parent === dir) break; // Reached filesystem root
     dir = parent;
   }
+  for (const visitedDir of visited) rootCache?.set(visitedDir, null);
   return null;
 }
 

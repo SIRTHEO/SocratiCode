@@ -7,8 +7,8 @@
 //
 // Validates three things that accessSync alone cannot:
 //   1. The N-API addon loads (require does not throw).
-//   2. It exports the `tree_sitter_gdscript` symbol that ast-grep needs.
-//   3. ast-grep can register it and parse a trivial GDScript snippet.
+//   2. It exposes a tree-sitter language object.
+//   3. ast-grep can load its `tree_sitter_gdscript` symbol and parse a snippet.
 //
 // Exit code 0 = all three checks passed.
 // Exit code 1 = a check failed (details on stdout).

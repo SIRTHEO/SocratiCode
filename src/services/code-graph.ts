@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import fsSync from "node:fs";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -19,7 +18,7 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotRootForFile, pythonRootsForFile, resolveImport, type GodotUidIndex } from "./graph-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotRootForFile, type GodotUidIndex, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -582,7 +581,7 @@ export function getDynamicLanguageStatus(): DynamicLanguageStatus {
  * Whether the GDScript tree-sitter parser was successfully registered.
  * tree-sitter-gdscript ships platform-specific prebuilds; on platforms
  * without a compatible artifact (e.g. linux-arm64) this stays false so
- * callers can skip AST processing and fall back to regex-based extraction.
+ * callers can skip AST processing and use syntax-aware fallback extraction.
  */
 export let gdscriptParserAvailable = false;
 
@@ -591,8 +590,8 @@ export let gdscriptParserAvailable = false;
  * process. This validates three things that a simple accessSync cannot:
  *
  *   1. The N-API addon loads (require does not throw).
- *   2. It exports the `tree_sitter_gdscript` symbol ast-grep needs.
- *   3. ast-grep can register it and parse a trivial GDScript snippet.
+ *   2. It exposes a tree-sitter language object.
+ *   3. ast-grep can load its `tree_sitter_gdscript` symbol and parse a snippet.
  *
  * Running in a child process is essential because
  * `registerDynamicLanguage` replaces all globally registered languages on
@@ -869,7 +868,7 @@ export async function getGraphableFiles(
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         // Mixed Elixir templates use dedicated parsers, not the Elixir grammar.
-        // Godot resource files (.tscn/.tres) have no AST grammar but use regex-based
+        // Godot resource files (.tscn/.tres) have no AST grammar but use tokenizer-based
         // import extraction for [ext_resource] declarations.
         const isGodotResource = ext === ".tscn" || ext === ".tres";
         const isGodotUid = ext === ".uid";
@@ -930,13 +929,18 @@ export async function buildCodeGraph(
   // so class names in one Godot project don't leak into another.
   const hasGdscript = files.some((f) => f.endsWith(".gd"));
   const hasGodotFiles = hasGdscript || files.some((f) => f.endsWith(".tscn") || f.endsWith(".tres"));
+  const godotRootCache = new Map<string, string | null>();
   // Per-project Godot indexes: maps each Godot project root to its scoped
   // class_name index. Used for per-file res:// and extends resolution.
-  const godotProjectIndexes = hasGodotFiles ? buildGodotProjectIndexes(resolvedPath, fileSet) : undefined;
+  const godotProjectIndexes = hasGodotFiles
+    ? buildGodotProjectIndexes(resolvedPath, fileSet, godotRootCache)
+    : undefined;
   // Per-project UID indexes: maps each Godot project root to its scoped
   // uid:// → relative path index. Used for uid:// resolution in GDScript
   // and Godot resource files. Godot prefers UIDs over text paths.
-  const godotProjectUidIndexes = hasGodotFiles ? buildGodotUidIndexes(resolvedPath, fileSet) : undefined;
+  const godotProjectUidIndexes = hasGodotFiles
+    ? buildGodotUidIndexes(resolvedPath, fileSet, godotRootCache)
+    : undefined;
 
   if (progress) {
     progress.filesTotal = files.length;
@@ -1086,12 +1090,18 @@ export async function buildCodeGraph(
     // Extra extensions with no parser are included as leaf nodes so they can be
     // targets of import edges, but we skip import extraction since we can't
     // parse them. Godot resource files (.tscn/.tres) are an exception: they
-    // have no AST grammar but use regex-based import extraction for
+    // have no AST grammar but use tokenizer-based import extraction for
     // [ext_resource] declarations, so they pass through to
     // the extraction path below.
     const isGodotResource = ext === ".tscn" || ext === ".tres";
     const isGodotUid = ext === ".uid";
-    if (!lang && !isElixirTemplate && !isGodotResource && !isGodotUid) {
+    // Sidecars stay in fileSet so the UID index can read them, but they are
+    // metadata rather than graph nodes and never enter the source-read path.
+    if (isGodotUid) {
+      if (progress) progress.filesProcessed++;
+      continue;
+    }
+    if (!lang && !isElixirTemplate && !isGodotResource) {
       const absolutePath = path.join(resolvedPath, relPath);
       if (!nodesMap.has(relPath)) {
         nodesMap.set(relPath, {
@@ -1166,13 +1176,6 @@ export async function buildCodeGraph(
     // as plaintext.
     node.language = language;
 
-    // .uid sidecar files are metadata only — no imports, no symbols.
-    // They exist in the file set solely so buildGodotUidIndexes can read them.
-    if (isGodotUid) {
-      if (progress) progress.filesProcessed++;
-      continue;
-    }
-
     const extractionLang = lang ?? (isGodotResource ? "godot-resource" : "elixir-template");
     const importInfos = extractImports(source, extractionLang, ext);
 
@@ -1232,7 +1235,7 @@ export async function buildCodeGraph(
     let fileUidIndex: GodotUidIndex | undefined;
     const isGodotFile = language === "gdscript" || language === "godot-resource";
     if (godotProjectIndexes && isGodotFile) {
-      fileGodotRoot = findGodotRootForFile(absolutePath, godotProjectIndexes);
+      fileGodotRoot = findGodotRootForFile(absolutePath, godotProjectIndexes, godotRootCache);
       if (fileGodotRoot) {
         fileClassNameIndex = godotProjectIndexes.get(fileGodotRoot);
         fileUidIndex = godotProjectUidIndexes?.get(fileGodotRoot);
@@ -1255,7 +1258,7 @@ export async function buildCodeGraph(
       // unaffected: there the path is absolute from the crate root and never
       // consulted the map to begin with.
       const scopedMods = imp.fromInlineBlock ? EMPTY_DECLARED_MODS : declaredMods;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true, fileClassNameIndex, fileGodotRoot, fileUidIndex, imp.fallbackSpecifier);
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true, fileClassNameIndex, fileGodotRoot, fileUidIndex, imp.fallbackSpecifier, imp.godotImportKind);
       if (resolved) {
         node.dependencies.push(resolved);
 

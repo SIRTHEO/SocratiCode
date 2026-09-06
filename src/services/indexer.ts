@@ -332,7 +332,7 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
         const isTopLevel = !parent || parent.kind() === "program" || parent.kind() === "source" || parent.kind() === "source_file"
           || parent.kind() === "translation_unit" || parent.kind() === "module"
           || parent.kind() === "export_statement" || parent.kind() === "decorated_definition"
-          || parent.kind() === "compilation_unit" || parent.kind() === "source"
+          || parent.kind() === "compilation_unit"
           // Depth 2: e.g., class inside namespace
           || (grandparent && (grandparent.kind() === "program" || grandparent.kind() === "source_file"
             || grandparent.kind() === "translation_unit" || grandparent.kind() === "compilation_unit"

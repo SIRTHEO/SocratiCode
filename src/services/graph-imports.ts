@@ -3,6 +3,7 @@
 import { Lang, parse, type SgNode } from "@ast-grep/napi";
 import { gdscriptParserAvailable } from "./code-graph.js";
 import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templates.js";
+import { tokenizeGdscript } from "./gdscript-syntax.js";
 import { logger } from "./logger.js";
 
 // ── Import extraction per language ───────────────────────────────────────
@@ -48,6 +49,8 @@ export interface ImportInfo {
    * declaration written inside a block does not count at file level.
    */
   fromInlineBlock?: boolean;
+  /** Distinguishes Godot path semantics for extends, preload, and runtime load. */
+  godotImportKind?: "extends" | "preload" | "load";
 }
 
 /**
@@ -175,7 +178,7 @@ export function parseTscnSectionHeader(
   // sub-resources like ext_resource).
   let i = 0;
   // Read the resource type
-  let typeStart = i;
+  const typeStart = i;
   while (i < inner.length && inner[i] !== " " && inner[i] !== "\t") {
     i++;
   }
@@ -189,7 +192,7 @@ export function parseTscnSectionHeader(
     if (i >= inner.length) break;
 
     // Read key
-    let keyStart = i;
+    const keyStart = i;
     while (i < inner.length && inner[i] !== "=" && inner[i] !== " " && inner[i] !== "\t") {
       i++;
     }
@@ -209,7 +212,7 @@ export function parseTscnSectionHeader(
     if (i < inner.length && (inner[i] === '"' || inner[i] === "'")) {
       const quote = inner[i];
       i++; // skip opening quote
-      let valStart = i;
+      const valStart = i;
       while (i < inner.length && inner[i] !== quote) {
         if (inner[i] === "\\" && i + 1 < inner.length) i++; // skip escaped char
         i++;
@@ -219,7 +222,7 @@ export function parseTscnSectionHeader(
       value = value.replace(/\\"/g, '"').replace(/\\'/g, "'").replace(/\\\\/g, "\\");
       if (i < inner.length) i++; // skip closing quote
     } else {
-      let valStart = i;
+      const valStart = i;
       while (i < inner.length && inner[i] !== " " && inner[i] !== "\t") i++;
       value = inner.slice(valStart, i);
     }
@@ -384,84 +387,48 @@ function phpRequireSpecifier(text: string): string | null {
 }
 
 /**
- * Regex-based GDScript import extraction. Used as a fallback when the
- * tree-sitter-gdscript parser is unavailable (e.g. linux-arm64 has no
- * compatible prebuild). Mirrors the AST-based extraction: preload/load
- * calls, extends with res:// or relative string paths, and extends with
- * class-name references (prefixed with "class:" so the resolver treats
- * them as class-name lookups rather than res:// paths).
- *
- * This fallback uses a simple line-by-line scan that skips comment lines
- * (starting with #) to avoid matching preload/extends inside comments.
- * String-literal-aware extraction is used when the parser is available.
- *
- * GDScript identifiers are case-sensitive and may begin with lowercase
- * letters, so the extends class-name pattern accepts any valid identifier
- * start, not just uppercase.
+ * Syntax-aware GDScript import fallback for hosts where the optional native
+ * parser cannot load. The lightweight lexer excludes comments and string
+ * bodies before recognizing direct preload/load arguments and extends forms.
  */
 export function extractGdscriptImportsRegex(source: string): ImportInfo[] {
   const imports: ImportInfo[] = [];
+  const tokens = tokenizeGdscript(source);
 
-  // Strip triple-quoted strings so extends/preload inside them are not
-  // matched. This mirrors the class_name extraction's string stripping.
-  const stripped = source
-    .replace(/"""[\s\S]*?"""/g, "")
-    .replace(/'''[\s\S]*?'''/g, "");
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.kind !== "identifier" || tokens[index - 1]?.text === ".") continue;
 
-  const lines = stripped.split("\n");
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    // Skip comment lines
-    if (trimmed.startsWith("#")) continue;
-
-    // preload("...") / load("...") — match the direct string argument.
-    // Handles raw strings (r"..."), single/double quotes.
-    // Does NOT match nested calls like load(resolve_path("...")) — the
-    // regex requires the string to be the direct argument.
-    // The raw prefix (r) is captured separately from the quote char so
-    // the backreference matches the closing quote correctly.
-    for (const match of line.matchAll(/\b(preload|load)\s*\(\s*(r)?(["'])((?:[^"'\\]|\\.)*)\3\s*\)/g)) {
-      const isRaw = !!match[2];
-      const quote = match[3];
-      const content = match[4];
-      const rawString = isRaw ? `r${quote}${content}${quote}` : `${quote}${content}${quote}`;
-      const decoded = decodeGdscriptString(rawString);
-      if (decoded) {
-        imports.push({ moduleSpecifier: decoded, isDynamic: match[1] === "load" });
-      }
+    if (token.text === "preload" || token.text === "load") {
+      if (tokens[index + 1]?.text !== "(" || tokens[index + 2]?.kind !== "string") continue;
+      const decoded = decodeGdscriptString(tokens[index + 2].text);
+      if (!decoded) continue;
+      imports.push({
+        moduleSpecifier: decoded,
+        isDynamic: token.text === "load",
+        godotImportKind: token.text,
+      });
+      continue;
     }
 
-    // extends "..." — string form (res://, relative, or uid://)
-    const extendsStringMatch = line.match(/\bextends\s+(r)?(["'])((?:[^"'\\]|\\.)*)\2/);
-    if (extendsStringMatch) {
-      const isRaw = !!extendsStringMatch[1];
-      const quote = extendsStringMatch[2];
-      const content = extendsStringMatch[3];
-      const rawString = isRaw ? `r${quote}${content}${quote}` : `${quote}${content}${quote}`;
-      const decoded = decodeGdscriptString(rawString);
+    if (token.text !== "extends") continue;
+    const target = tokens[index + 1];
+    if (target?.kind === "string") {
+      const decoded = decodeGdscriptString(target.text);
       if (decoded) {
-        imports.push({ moduleSpecifier: decoded, isDynamic: false });
+        imports.push({ moduleSpecifier: decoded, isDynamic: false, godotImportKind: "extends" });
       }
-    } else {
-      // extends ClassName — class-name reference
-      // GDScript identifiers are case-sensitive and may start with
-      // lowercase letters, so accept any valid identifier start.
-      const extendsClassMatch = line.match(/\bextends\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/);
-      if (extendsClassMatch) {
-        const rawType = extendsClassMatch[1].trim();
-        const segments = rawType.split(".");
-        // For dotted paths like Outer.Inner, take the first segment as the
-        // class name — Inner is a nested class of the globally registered
-        // class Outer, and buildClassNameIndex only records top-level
-        // class_name declarations, so class:Inner would never resolve.
-        const className = segments.length > 1
-          ? (segments[0] ?? rawType).trim()
-          : rawType;
-        imports.push({ moduleSpecifier: `class:${className}`, isDynamic: false });
-      }
+      continue;
+    }
+    if (target?.kind === "identifier") {
+      imports.push({
+        moduleSpecifier: `class:${target.text}`,
+        isDynamic: false,
+        godotImportKind: "extends",
+      });
     }
   }
+
   return imports;
 }
 
@@ -500,7 +467,7 @@ export function extractGodotResourceImports(source: string): ImportInfo[] {
     const uid = section.attrs.get("uid");
     const path = section.attrs.get("path");
 
-    if (uid && uid.startsWith("uid://")) {
+    if (uid?.startsWith("uid://")) {
       // UID is primary; path is the fallback when UID resolution misses.
       // Emit a single import to avoid duplicate edges.
       imports.push({
@@ -1479,10 +1446,10 @@ export function extractImports(
     return extractGodotResourceImports(source);
   }
 
-  // ── GDScript: AST-based extraction when parser available, regex fallback ─
+  // ── GDScript: AST extraction with a syntax-aware fallback ──────────────
   // tree-sitter-gdscript is an optional dependency resolved via node-gyp-build.
   // When the native binary is available, AST extraction avoids false matches
-  // in comments and string literals. When unavailable, fall back to regex.
+  // in comments and string literals. When unavailable, use the lightweight lexer.
   if (langKey === "gdscript") {
     if (!gdscriptParserAvailable) {
       return extractGdscriptImportsRegex(source);
@@ -1501,7 +1468,7 @@ export function extractImports(
         if (stringNode) {
           const decoded = decodeGdscriptString(stringNode.text());
           if (decoded) {
-            imports.push({ moduleSpecifier: decoded, isDynamic: false });
+            imports.push({ moduleSpecifier: decoded, isDynamic: false, godotImportKind: "extends" });
           }
         } else {
           // extends ClassName — class-name reference
@@ -1512,7 +1479,7 @@ export function extractImports(
             const className = segments.length > 1
               ? (segments[0] ?? rawType).trim()
               : rawType;
-            imports.push({ moduleSpecifier: `class:${className}`, isDynamic: false });
+            imports.push({ moduleSpecifier: `class:${className}`, isDynamic: false, godotImportKind: "extends" });
           }
         }
       }
@@ -1537,11 +1504,16 @@ export function extractImports(
         // The first string in the arguments is the direct argument.
         // If the first argument is not a string (e.g. a call expression),
         // this is a dynamic expression — skip it, do not extract a path.
-        const directString = argChildren.find((c) => c.kind() === "string");
+        const firstArgument = argChildren.find((child) => !["(", ")", ","].includes(String(child.kind())));
+        const directString = firstArgument?.kind() === "string" ? firstArgument : undefined;
         if (directString) {
           const decoded = decodeGdscriptString(directString.text());
           if (decoded) {
-            imports.push({ moduleSpecifier: decoded, isDynamic: funcName === "load" });
+            imports.push({
+              moduleSpecifier: decoded,
+              isDynamic: funcName === "load",
+              godotImportKind: funcName,
+            });
           }
         }
         // If no direct string argument, this is a dynamic expression like
@@ -1998,7 +1970,7 @@ export function extractImports(
       default:
         // Unsupported language for import extraction.
         // GDScript is handled earlier (before the AST switch) because it
-        // has a separate regex fallback path.
+        // has a separate parser-independent fallback path.
         break;
     }
   } catch (err) {
