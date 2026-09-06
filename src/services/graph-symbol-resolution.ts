@@ -446,7 +446,19 @@ export function resolveCallSites(
       const binding = bindings.find((b) => b.local === segments[0]);
       if (binding) {
         const bound = binding.path.split("::").map((s) => s.trim()).filter(Boolean);
-        if (bound[0] === "crate") inOwnCrate = true;
+        // The same path, so the same scope: `use crate as root;` makes
+        // `root::helper()` mean `crate::helper()`, and reading it in the
+        // caller's own scope would answer nothing where the plain spelling
+        // answers the crate root.
+        let boundRoot: string | null = null;
+        if (bound[0] === "crate") {
+          inOwnCrate = true;
+          boundRoot = crateRootFileOf(callerFile);
+          if (boundRoot) {
+            homes = [boundRoot];
+            scopeDeps = [...new Set([boundRoot, ...(depsByFile.get(boundRoot) ?? []), ...deps])];
+          }
+        }
         if (bound[0] === "super") {
           // `use super::config;` binds the parent's `config`, so the bound path
           // is read where `super::config` is read. Stripping the hop and
@@ -464,7 +476,8 @@ export function resolveCallSites(
         } else {
           const head = bound[0] === "crate" || bound[0] === "self" ? bound.slice(1) : bound;
           rest = [...head, ...segments.slice(1)];
-          if (rest.length === 0) return null;
+          // `use crate as root;` binds the crate root itself.
+          if (rest.length === 0) return boundRoot ? [boundRoot] : null;
         }
       }
     }

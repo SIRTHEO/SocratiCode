@@ -75,7 +75,12 @@ pub fn go() -> u32 {
     // `lib.rs` — the import runs the other way — so `crate::helper()` is only
     // reachable by starting the path where Rust starts it.
     write("src/deep/mod.rs", "pub mod inner;\n");
-    write("src/deep/inner.rs", "pub fn go() -> u32 { crate::helper() }\n");
+    write("src/deep/inner.rs", `use crate as root;
+
+pub fn go() -> u32 { crate::helper() }
+
+pub fn go_aliased() -> u32 { root::helper() }
+`);
     write("sub/Cargo.toml", '[package]\nname = "sub"\nedition = "2021"\n');
     write("sub/src/lib.rs", "pub mod config;\n");
     write("sub/src/config.rs", "pub fn load() -> u32 { 2 }\n");
@@ -109,6 +114,14 @@ pub fn go() -> u32 {
 
   it("reads `crate::` from the crate root, which a nested module never imports", async () => {
     expect(await candidatesOf("src/deep/inner.rs", "helper", "crate")).toEqual([
+      "src/lib.rs::helper#5",
+    ]);
+  });
+
+  it("reads an alias for the crate root the same way", async () => {
+    // `use crate as root;` is the same path under another name, so it must
+    // reach the same file — not the caller's own scope, which answers nothing.
+    expect(await candidatesOf("src/deep/inner.rs", "helper", "root")).toEqual([
       "src/lib.rs::helper#5",
     ]);
   });
