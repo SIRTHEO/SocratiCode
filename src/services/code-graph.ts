@@ -829,7 +829,7 @@ export async function buildCodeGraph(
    * anchored at a file's own module cannot reach them, so resolution drops
    * them from that path's candidates. Resolution input only, never persisted.
    */
-  rustInlineDeclaredSymbols: Set<string>;
+  rustInlineDeclaredSymbols: Map<string, string>;
 }> {
   ensureDynamicLanguages();
 
@@ -854,7 +854,7 @@ export async function buildCodeGraph(
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
   const rustBindingsByFile = new Map<string, RustUseBinding[]>();
   const rustInlineScopedCalls = new Set<SymbolEdge>();
-  const rustInlineDeclaredSymbols = new Set<string>();
+  const rustInlineDeclaredSymbols = new Map<string, string>();
 
   // Per-reason counts, holding only the reasons that actually fired — the build log
   // emits `skipReasons` straight from this map, so it never carries a zero.
@@ -1107,7 +1107,9 @@ export async function buildCodeGraph(
       // Same reason, one level down: which declarations sit inside an inline
       // `mod` is visible in the extractor and nowhere after it.
       if (extracted.inlineModSymbolIds) {
-        for (const id of extracted.inlineModSymbolIds) rustInlineDeclaredSymbols.add(id);
+        for (const [id, owner] of extracted.inlineModSymbolIds) {
+          rustInlineDeclaredSymbols.set(id, owner);
+        }
       }
       if (extracted.bindings && extracted.bindings.length > 0) {
         rustBindingsByFile.set(relPath, extracted.bindings);

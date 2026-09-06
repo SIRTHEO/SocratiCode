@@ -218,7 +218,7 @@ export function resolveCallSites(
    * Absent for every other language, and absent when a caller does not have
    * it: nothing is dropped then, which is what this did before.
    */
-  rustInlineDeclaredSymbols?: Set<string>,
+  rustInlineDeclaredSymbols?: ReadonlyMap<string, string>,
 ): void {
   // Build a fast lookup: file → Map<symbolName, SymbolNode[]>
   const symbolIndexByFile = new Map<string, Map<string, SymbolNode[]>>();
@@ -363,15 +363,25 @@ export function resolveCallSites(
    * `src/a.rs`), so "each hop goes deeper" is not what stops it. The loop runs
    * once per segment and ends.
    */
-  function walkModulePath(homes: string[], segments: string[]): string[] {
-    if (segments.length === 0) return [];
+  function walkModulePath(homes: string[], segments: string[]): string[] | null {
+    if (segments.length === 0) return null;
     let frontier = homes;
+    let entered = false;
     for (const segment of segments) {
       const next = new Set<string>();
       for (const file of frontier) {
         for (const child of childModulesOf(file, segment)) next.add(child);
       }
-      if (next.size === 0) return [];
+      // Two empty answers, and they are not the same. `null` — the first hop
+      // found nothing — means the module tree is invisible here, and the
+      // suffix match is the only thing left to try. `[]` — a hop failed after
+      // an earlier one succeeded — means the walk read a real module and the
+      // name is not in it, which rustc answers with E0433. Falling back there
+      // picks any reachable file whose path ends the same way: measured on a
+      // fixture, `crate::a::foglia::f()` with no `foglia` under `a` came back
+      // as the imported `altro/a/foglia.rs`, reported `unique`.
+      if (next.size === 0) return entered ? [] : null;
+      entered = true;
       frontier = [...next];
     }
     return frontier;
@@ -786,9 +796,13 @@ export function resolveCallSites(
      * `crate::task` answer above.
      */
     const modulePathFiles = (segments: string[]): string[] => {
-      const walked = confine(walkModulePath(homes, segments));
-      if (walked.length > 0) return walked;
-      return matchModulePath(reachable, segments);
+      const walked = walkModulePath(homes, segments);
+      // The walk never entered a module, so it has nothing to say and the
+      // suffix match answers as it did.
+      if (walked === null) return matchModulePath(reachable, segments);
+      // It did enter one. Its answer stands, confined to the caller's crate,
+      // and an empty one is a verdict rather than a shrug.
+      return confine(walked);
     };
 
     // A module path, walked segment by segment from the scope it starts in.
@@ -851,16 +865,27 @@ export function resolveCallSites(
    * grounds that the symbol sits inside an inline `mod` withdrew 35 answers
    * that were right.
    *
-   * A glob is recorded under `*` because its names cannot be enumerated here.
-   * It is read as "this might be reachable", which keeps the refusal to the
-   * case that is provably out of reach.
+   * A glob is recorded under `*` and carries the module it reads from, which
+   * is what bounds it: `pub use imp::*;` exports what `imp` exports and
+   * nothing from a sibling `mod altro { … }` in the same file — rustc answers
+   * E0425 for `crate::glob::nascosto()` when `nascosto` is in `altro`. So the
+   * glob's own path has to name the inline `mod` the symbol sits in, and the
+   * outermost one is the one the file's top level can name.
    */
   function reExportedToTopLevel(id: string, name: string): boolean {
     const file = fileOfSymbolId.get(id);
     if (!file) return false;
     const declared = rustBindingsByFile?.get(file);
     if (!declared) return false;
-    return declared.some((b) => b.local === name || b.local === "*");
+    const owner = rustInlineDeclaredSymbols?.get(id);
+    return declared.some((b) => {
+      if (b.local === name) return true;
+      if (b.local !== "*") return false;
+      // `use imp::*;` reads from `imp`; `use self::imp::*;` and
+      // `use crate::a::imp::*;` from the last segment of their path.
+      const from = b.path.split("::").pop();
+      return owner !== undefined && from === owner;
+    });
   }
 
   for (const [callerFile, edges] of outgoingCallsByFile.entries()) {

@@ -54,6 +54,9 @@ pub mod glob;
 pub fn from_root() -> u32 { crate::a::c::only_inside() }
 pub fn by_name() -> u32 { crate::riesporta::per_nome() }
 pub fn by_glob() -> u32 { crate::glob::only_via_glob() }
+pub fn past_the_glob() -> u32 { crate::glob::nascosto() }
+pub fn by_self_alias() -> u32 { A::helper() }
+use crate::a::{self as A};
 `,
     );
     // The two ways a file lifts a name out of its own inline `mod` to its top
@@ -70,6 +73,10 @@ pub(crate) use self::imp::per_nome;
 `);
     write("src/glob.rs", `mod imp {
     pub fn only_via_glob() -> u32 { 31 }
+}
+
+mod altro {
+    pub fn nascosto() -> u32 { 32 }
 }
 
 pub use imp::*;
@@ -424,6 +431,28 @@ mod tests {
     // `super::counters::inc_num_inc_notify_local()` and its neighbours.
     const edge = edgeFor("by_glob", "crate::glob", "only_via_glob");
     expect(edge.calleeCandidates).toEqual(["src/glob.rs::only_via_glob#2"]);
+    expect(edge.confidence).toBe("unique");
+  });
+
+  it("does not let a glob carry a sibling inline mod it never reads from", () => {
+    // The other half of the exemption above, and the one it was missing:
+    // `pub use imp::*;` exports what `imp` exports, so `nascosto` in a sibling
+    // `mod altro { … }` stays out. cargo 1.98 on this shape:
+    // `error[E0425]: cannot find function nascosto in module crate::glob`.
+    // Exempting on "the file has some glob" answered it `unique`.
+    const edge = edgeFor("past_the_glob", "crate::glob", "nascosto");
+    expect(edge.calleeCandidates).toEqual([]);
+    expect(edge.confidence).toBe("unresolved");
+  });
+
+  it("reads `use crate::a::{self as A};` as the module, not as `a::self`", () => {
+    // Inside a use list, `self` is the module the list hangs off, so the
+    // binding names `crate::a`. Recorded literally as `crate::a::self` it
+    // matched no module and `A::helper()` went unresolved. cargo 1.98
+    // compiles the form and tokio writes it — `use super::unix::{self as
+    // os_impl};` in `signal/ctrl_c.rs`, which this recovers.
+    const edge = edgeFor("by_self_alias", "A", "helper");
+    expect(edge.calleeCandidates).toEqual(["src/a.rs::helper#6"]);
     expect(edge.confidence).toBe("unique");
   });
 });

@@ -442,14 +442,18 @@ describe("Rust multi-hop module paths", () => {
     );
     // The homonym: same last two segments, a different module.
     write("src/other/mod.rs", "pub mod a;\n");
-    write("src/other/a/mod.rs", "pub mod b;\n");
+    // A module the caller imports whose path ends in `a/missing`, which is
+    // what a suffix match reaches for `crate::a::missing` — a path that does
+    // not name it, since `src/a/` has no `missing`.
+    write("src/other/a/mod.rs", "pub mod b;\npub mod missing;\n");
+    write("src/other/a/missing.rs", "pub fn f() -> u32 { 51 }\n");
     write(
       "src/other/a/b.rs",
       "pub fn f() -> u32 { 2 }\n\npub struct Tipo;\n\nimpl Tipo {\n    pub fn metodo() -> u32 { 42 }\n}\n",
     );
     write(
       "src/caller.rs",
-      "use crate::other::a::b;\n\npub fn go() -> u32 {\n    let _ = b::f();\n    crate::a::b::f()\n}\n\npub fn deeper() -> u32 {\n    crate::deep::leaf::g()\n}\n\npub fn by_path() -> u32 {\n    crate::a::b::Tipo::metodo()\n}\n",
+      "use crate::other::a::{b, missing as _m};\n\npub fn go() -> u32 {\n    let _ = b::f();\n    crate::a::b::f()\n}\n\npub fn deeper() -> u32 {\n    crate::deep::leaf::g()\n}\n\npub fn by_path() -> u32 {\n    crate::a::b::Tipo::metodo()\n}\n\npub fn half_walked() -> u32 {\n    crate::a::missing::f()\n}\n",
     );
     // A `crate::` written in an integration test is the test's own crate, and
     // its modules are filed beside it. The library has a `support` of its own,
@@ -523,5 +527,16 @@ describe("Rust multi-hop module paths", () => {
     expect(await candidatesOf("src/caller.rs", "metodo", "crate::a::b::Tipo")).toEqual([
       "src/a/b.rs::metodo#6",
     ]);
+  });
+
+  it("does not fall back to a suffix after the walk entered a module", async () => {
+    // Two empty answers that are not the same. The walk reaches `src/a/`,
+    // which declares no `missing`, so the path names nothing — rustc:
+    // `error[E0433]: cannot find missing in a`. Falling back to the suffix
+    // there picks `src/other/a/missing.rs`, which the caller does import and
+    // whose path ends the same way, and reports it `unique`. The fallback is
+    // for where the walk never entered a module at all, which is a different
+    // silence.
+    expect(await candidatesOf("src/caller.rs", "f", "crate::a::missing")).toEqual([]);
   });
 });

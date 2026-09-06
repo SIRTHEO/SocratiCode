@@ -70,7 +70,7 @@ export interface ExtractedSymbols {
    * beside the symbols and is never a field on one, so nothing about it is
    * persisted and a graph built before this still reads.
    */
-  inlineModSymbolIds?: string[];
+  inlineModSymbolIds?: Array<[id: string, outermostInlineMod: string]>;
 }
 
 /** Build a stable SymbolNode.id. */
@@ -1865,6 +1865,26 @@ function rustInlineModDepth(node: any): number {
 }
 
 /**
+ * The name of the outermost inline `mod` around a node, or `null` when there
+ * is none.
+ *
+ * That is the one the file's own top level can name, and so the only one a
+ * `use imp::*;` written there can read from: a `pub use imp::*;` carries what
+ * `imp` exports and nothing from a sibling `mod altro { … }`, which rustc
+ * refuses with E0425.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function rustOutermostInlineMod(node: any): string | null {
+  let outermost: string | null = null;
+  for (let p = node.parent(); p; p = p.parent()) {
+    if (p.kind() !== "mod_item") continue;
+    const nameNode = p.field("name");
+    if (nameNode) outermost = nameNode.text();
+  }
+  return outermost;
+}
+
+/**
  * A qualifier rewritten as the file itself would have written it.
  *
  * `super` counts modules, not files, and an inline `mod` is a module: inside
@@ -1944,7 +1964,15 @@ function collectRustUseBindings(decl: any, bindings: RustUseBinding[]): void {
         const pathNode = node.field("path");
         const aliasNode = node.field("alias");
         if (!pathNode || !aliasNode) return;
-        bindings.push({ local: aliasNode.text(), path: join(prefix, pathNode.text()) });
+        // `use crate::a::{self as A};` names `crate::a`, not `crate::a::self`:
+        // inside a list, `self` is the module the list hangs off. Recorded
+        // literally, `A::run()` matched no module and went unresolved. cargo
+        // 1.98 compiles that fixture with `A::run()` returning `a`'s own.
+        const target = pathNode.text();
+        bindings.push({
+          local: aliasNode.text(),
+          path: target === "self" ? prefix : join(prefix, target),
+        });
         return;
       }
       case "scoped_use_list": {
@@ -2013,7 +2041,7 @@ function extractFromRust(
   // this is the only place the nesting is still visible: by the time
   // resolution has the symbols, an inline module has left no trace on them.
   // Ids, not nodes, because that is what a candidate list holds.
-  const inlineModSymbolIds: string[] = [];
+  const inlineModSymbolIds: Array<[string, string]> = [];
 
   for (const fn of safeFindAll(root, "function_item")) {
     const nameNode = safeFind(fn, "identifier");
@@ -2027,7 +2055,8 @@ function extractFromRust(
       name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
     };
     declared.push({ sym, offset: r.start.index });
-    if (rustInlineModDepth(fn) > 0) inlineModSymbolIds.push(sym.id);
+    const fnInlineMod = rustOutermostInlineMod(fn);
+    if (fnInlineMod) inlineModSymbolIds.push([sym.id, fnInlineMod]);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
@@ -2122,7 +2151,8 @@ function extractFromRust(
       },
       offset: r.start.index,
     });
-    if (rustInlineModDepth(item) > 0) inlineModSymbolIds.push(id);
+    const itemInlineMod = rustOutermostInlineMod(item);
+    if (itemInlineMod) inlineModSymbolIds.push([id, itemInlineMod]);
   }
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
