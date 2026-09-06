@@ -1217,6 +1217,58 @@ describe("Rust qualified calls, across a workspace", () => {
   });
 });
 
+describe("Rust `super::` from a file at the project root", () => {
+  // A crate whose root module sits at the top of the tree: `lib.rs` beside
+  // `foo.rs`, no `src/`. The parent of `foo.rs` has no directory to be named
+  // after, and a path built by cutting the last character off the file name
+  // — which is what slicing to the last `/` does when there is none — matches
+  // nothing at all.
+  const LIB = "lib.rs";
+  const FOO = "foo.rs";
+
+  function sym(file: string, name: string, line: number): SymbolNode {
+    return {
+      id: `${file}::${name}#${line}`,
+      name,
+      qualifiedName: name,
+      kind: "function",
+      file,
+      line,
+      endLine: line,
+      language: "rust",
+    };
+  }
+
+  it("finds the crate root as the parent", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        { relativePath: LIB, imports: [], exports: [], dependencies: [FOO], dependents: [] },
+        { relativePath: FOO, imports: [], exports: [], dependencies: [], dependents: [LIB] },
+      ],
+      edges: [],
+    };
+    const edge: SymbolEdge = {
+      callerId: `${FOO}::caller#1`,
+      calleeName: "helper",
+      calleeCandidates: [],
+      confidence: "unresolved",
+      kind: "call",
+      calleeQualifier: "super",
+      callSite: { file: FOO, line: 2 },
+    };
+    resolveCallSites(
+      graph,
+      new Map<string, SymbolNode[]>([
+        [LIB, [sym(LIB, "helper", 3)]],
+        [FOO, [sym(FOO, "caller", 1)]],
+      ]),
+      new Map<string, SymbolEdge[]>([[FOO, [edge]]]),
+    );
+    expect(edge.calleeCandidates).toEqual([`${LIB}::helper#3`]);
+    expect(edge.confidence).toBe("unique");
+  });
+});
+
 describe("Rust qualified calls rooted in `super`", () => {
   // A module with both a parent and a child of the same name, which is what
   // separates "read in the parent's scope" from "read in the caller's".

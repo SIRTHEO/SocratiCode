@@ -218,17 +218,42 @@ export function resolveCallSites(
   function parentModulesOf(file: string): string[] {
     const noExt = stripKnownExt(file);
     const stem = noExt.slice(noExt.lastIndexOf("/") + 1);
-    let dir = file.slice(0, file.lastIndexOf("/"));
+    const lastSlash = file.lastIndexOf("/");
+    // A file at the project root has no directory, and `""` is the answer, not
+    // `file.slice(0, -1)` — which is the name with its last letter cut off and
+    // matches nothing.
+    let dir = lastSlash >= 0 ? file.slice(0, lastSlash) : "";
     // A module root stands for its own directory, so its parent is the
     // directory above.
     if (stem === "mod" || stem === "lib" || stem === "main") {
       if (!dir.includes("/")) return [];
       dir = dir.slice(0, dir.lastIndexOf("/"));
     }
-    if (!dir) return [];
-    const candidates = [`${dir}/mod.rs`, `${dir}.rs`, `${dir}/lib.rs`, `${dir}/main.rs`];
+    // At the root the parent can only be the crate root itself, and `.rs` is
+    // not a file name.
+    const candidates = dir
+      ? [`${dir}/mod.rs`, `${dir}.rs`, `${dir}/lib.rs`, `${dir}/main.rs`]
+      : ["lib.rs", "main.rs"];
     const dependents = new Set(dependentsByFile.get(file) ?? []);
     return candidates.filter((c) => dependents.has(c));
+  }
+
+  /**
+   * The file a `crate::` path starts from: the crate's own root module.
+   *
+   * The manifests give the crate's directory; the root module is `lib.rs` or
+   * `main.rs` in it, with or without a `src/`, and it is a file this project
+   * extracted or it is nothing. `null` leaves `crate::` reading the caller's
+   * own scope, which is what it did before the crate map existed.
+   */
+  function crateRootFileOf(callerFile: string): string | null {
+    const prefix = rustCrateRootByFile?.get(callerFile);
+    if (prefix === undefined) return null;
+    for (const name of ["src/lib.rs", "src/main.rs", "lib.rs", "main.rs"]) {
+      const candidate = `${prefix}${name}`;
+      if (symbolsByFile.has(candidate)) return candidate;
+    }
+    return null;
   }
 
   /**
@@ -395,9 +420,25 @@ export function resolveCallSites(
       if (rest.length === 0) return homes;
     } else if (segments[0] === "crate") {
       rest = segments.slice(1);
-      if (rest.length === 0) return null;
       // Confined to the caller's own crate, which is what `crate::` means.
       inOwnCrate = true;
+      // And read from the crate root, which is where the path starts. A nested
+      // module does not import the root — the root imports it — so
+      // `crate::helper()` would otherwise miss a `helper` declared there, and
+      // `crate::a::b()` would need the caller to have imported `a` itself,
+      // which Rust does not ask of it.
+      // The root is added to the caller's own scope, not put in its place: a
+      // module path is matched one hop and by suffix, so `crate::sync::watch`
+      // is found through the caller's `watch.rs` and never through the root,
+      // which only declares `sync`. Both sides are inside the same crate, and
+      // the confinement below still applies to both.
+      const root = crateRootFileOf(callerFile);
+      if (root) {
+        homes = [root];
+        scopeDeps = [...new Set([root, ...(depsByFile.get(root) ?? []), ...deps])];
+      }
+      // `crate::helper()` names the root module itself.
+      if (rest.length === 0) return root ? [root] : null;
     } else {
       // An imported binding rewrites the head into the path it names, so
       // `use crate::a::Type as Alias` makes `Alias::method()` reach exactly

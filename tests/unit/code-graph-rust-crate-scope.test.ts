@@ -30,8 +30,12 @@ describe("Rust crate scope for `crate::`", () => {
     fs.writeFileSync(abs, body);
   };
 
-  /** Resolve `callerRel`'s only qualified call and return its candidates. */
-  async function candidatesOf(callerRel: string): Promise<string[]> {
+  /** Resolve one qualified call written in `callerRel` and return its candidates. */
+  async function candidatesOf(
+    callerRel: string,
+    name = "load",
+    qualifier = "crate::config",
+  ): Promise<string[]> {
     const graph = await buildCodeGraph(root);
     resolveCallSites(
       graph,
@@ -39,11 +43,12 @@ describe("Rust crate scope for `crate::`", () => {
       graph.outgoingCallsByFile,
       graph.rustBindingsByFile,
       graph.rustCrateRootByFile,
+      graph.rustInlineScopedCalls,
     );
     const edge = (graph.outgoingCallsByFile.get(callerRel) ?? []).find(
-      (e) => e.calleeName === "load" && e.calleeQualifier === "crate::config",
+      (e) => e.calleeName === name && e.calleeQualifier === qualifier,
     );
-    expect(edge, `no qualified call to crate::config::load in ${callerRel}`).toBeDefined();
+    expect(edge, `no qualified call to ${qualifier}::${name} in ${callerRel}`).toBeDefined();
     return (edge?.calleeCandidates ?? []).slice().sort();
   }
 
@@ -55,7 +60,10 @@ describe("Rust crate scope for `crate::`", () => {
     // puts `sub/src/config.rs` inside it.
     write("Cargo.toml", '[package]\nname = "rootpkg"\nedition = "2021"\n\n[dependencies]\nsub = { path = "sub" }\n');
     write("src/lib.rs", `pub mod config;
+pub mod deep;
 use sub::config as subcfg;
+
+pub fn helper() -> u32 { 7 }
 
 pub fn go() -> u32 {
     let _ = subcfg::load();
@@ -63,6 +71,11 @@ pub fn go() -> u32 {
 }
 `);
     write("src/config.rs", "pub fn load() -> u32 { 1 }\n");
+    // A nested module calling the crate root. `deep/inner.rs` never imports
+    // `lib.rs` — the import runs the other way — so `crate::helper()` is only
+    // reachable by starting the path where Rust starts it.
+    write("src/deep/mod.rs", "pub mod inner;\n");
+    write("src/deep/inner.rs", "pub fn go() -> u32 { crate::helper() }\n");
     write("sub/Cargo.toml", '[package]\nname = "sub"\nedition = "2021"\n');
     write("sub/src/lib.rs", "pub mod config;\n");
     write("sub/src/config.rs", "pub fn load() -> u32 { 2 }\n");
@@ -92,6 +105,12 @@ pub fn go() -> u32 {
 
   it("keeps a root package's `crate::` out of a crate beside it", async () => {
     expect(await candidatesOf("src/lib.rs")).toEqual(["src/config.rs::load#1"]);
+  });
+
+  it("reads `crate::` from the crate root, which a nested module never imports", async () => {
+    expect(await candidatesOf("src/deep/inner.rs", "helper", "crate")).toEqual([
+      "src/lib.rs::helper#5",
+    ]);
   });
 
   it("keeps a crate's `crate::` out of a crate nested inside its own directory", async () => {
