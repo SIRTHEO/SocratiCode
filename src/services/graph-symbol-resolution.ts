@@ -143,6 +143,14 @@ export function resolveCallSites(
    * not have it — `crate::` then confines nothing, which is what it did before.
    */
   rustCrateRootByFile?: Map<string, string>,
+  /**
+   * The edges whose qualifier is rooted in an inline `mod`, by identity. That
+   * scope has no file to name and no spelling this can follow, so the call is
+   * left unresolved with its qualifier rather than answered out of the file:
+   * the file holds the sibling inline modules too, and a `helper` declared in
+   * one of those is not something Rust can reach from the other.
+   */
+  rustInlineScopedCalls?: Set<SymbolEdge>,
 ): void {
   // Build a fast lookup: file → Map<symbolName, SymbolNode[]>
   const symbolIndexByFile = new Map<string, Map<string, SymbolNode[]>>();
@@ -468,7 +476,9 @@ export function resolveCallSites(
       // every language — so the day another extractor fills it, this would
       // apply Rust's semantics to it silently.
       if (edge.calleeQualifier && callerFile.endsWith(".rs")) {
-        const scope = rustQualifierScope(callerFile, edge.calleeQualifier, deps, bindings);
+        const scope = rustInlineScopedCalls?.has(edge)
+          ? null
+          : rustQualifierScope(callerFile, edge.calleeQualifier, deps, bindings);
         if (scope) {
           for (const file of scope) candidates.push(...findSymbolsInTarget(file, edge.calleeName));
         }

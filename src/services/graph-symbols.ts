@@ -48,6 +48,15 @@ export interface ExtractedSymbols {
      * `Vec::new()`, `std::fs` in `std::fs::copy()`. Absent on a bare call.
      */
     calleeQualifier?: string;
+    /**
+     * The qualifier is rooted in an inline `mod`, which has no file to point
+     * at and no spelling resolution can follow. Set only for Rust, and only
+     * for the shape that cannot be rewritten as file-relative; resolution
+     * leaves such a call unresolved rather than answering out of the wrong
+     * scope. In memory only — it reaches resolution beside the edges and is
+     * never part of one.
+     */
+    qualifierRootedInInlineMod?: boolean;
     callSite: { file: string; line: number };
   }>;
   /** Rust `use` bindings declared by this file. Absent for every other language. */
@@ -1848,39 +1857,50 @@ function extractCalleeInfoRust(fn: any): { name: string; qualifier?: string } | 
  * the file itself would write it: bare is the file's own namespace, which is
  * both its child modules and the names its `use` declarations bring in, and
  * `self::` would be read as the modules alone.
+ *
+ * `rootedInInlineMod` says the rewrite could not be made: the path never
+ * climbed out of the inline modules, and what it is rooted in has no file.
+ * The qualifier then comes back as it was written, for a reader, and
+ * resolution refuses it rather than answering out of a scope that is not the
+ * one the path names.
  */
-// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
-function rustQualifierFromFile(node: any, qualifier: string): string {
+function rustQualifierFromFile(
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  node: any,
+  qualifier: string,
+): { qualifier: string; rootedInInlineMod: boolean } {
+  const asWritten = { qualifier, rootedInInlineMod: false };
   const segments = qualifier.split("::");
-  if (segments[0] !== "super") return qualifier;
+  if (segments[0] !== "super") return asWritten;
 
   let inlineMods = 0;
   for (let p = node.parent(); p; p = p.parent()) {
     if (p.kind() === "mod_item") inlineMods += 1;
   }
-  if (inlineMods === 0) return qualifier;
+  if (inlineMods === 0) return asWritten;
 
   let consumed = 0;
   while (consumed < inlineMods && segments[consumed] === "super") consumed += 1;
 
   // Fewer `super` than inline modules: the path never climbed out of them, so
-  // it is rooted in a module that lives inside this file. `mod a { mod b {
-  // super::c::f() } }` names the `c` declared beside `b`, and writing what is
-  // left bare hands it to a `mod c;` on the file — another file entirely,
-  // answered as `unique`.
+  // it is rooted in a module that lives inside this file and has no file of
+  // its own to name. `mod a { mod b { super::c::f() } }` means the `c` beside
+  // `b`, and writing what is left bare hands it to a `mod c;` on the file —
+  // another file entirely, answered as `unique`.
   //
-  // What is left is dropped rather than followed, because two shapes are
-  // spelled the same and only one has a file to point at: `c` may be an inline
-  // module, and it may be a file module that an inline module declares —
-  // `mod a { pub mod c; }` in `x.rs` is `x/a/c.rs`, which tokio writes 23
-  // times. The file is what is certain either way, so the file is all this
-  // says, and the second shape is left unresolved rather than answered wrong.
-  if (consumed < inlineMods) return "self";
+  // Answering with the file instead is no better: the file holds the sibling
+  // inline modules too, so `super::helper()` would collect a `helper` that
+  // Rust cannot see from there and hand it to whoever walks the candidates.
+  // Nothing here can name that scope — a path may even be rooted at a file
+  // module an inline module declares, since `mod a { pub mod c; }` in `x.rs`
+  // is `x/a/c.rs`, which tokio writes 23 times — so the call goes unresolved
+  // and keeps the qualifier as the source wrote it.
+  if (consumed < inlineMods) return { qualifier, rootedInInlineMod: true };
 
   const rest = segments.slice(consumed);
   // What is left may still climb above the file, and then it is a
   // file-relative `super::` path, which is exactly how it now reads.
-  return rest.length === 0 ? "self" : rest.join("::");
+  return { qualifier: rest.length === 0 ? "self" : rest.join("::"), rootedInInlineMod: false };
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
@@ -2060,13 +2080,15 @@ function extractFromRust(
     if (!callee) continue;
     const r = node.range();
     const callLine = r.start.line + 1;
+    const qualifier = callee.qualifier
+      ? rustQualifierFromFile(node, callee.qualifier)
+      : undefined;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
       calleeName: callee.name,
       kind: "call",
-      calleeQualifier: callee.qualifier
-        ? rustQualifierFromFile(node, callee.qualifier)
-        : undefined,
+      calleeQualifier: qualifier?.qualifier,
+      qualifierRootedInInlineMod: qualifier?.rootedInInlineMod ? true : undefined,
       callSite: { file, line: callLine },
     });
   }

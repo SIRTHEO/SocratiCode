@@ -253,6 +253,7 @@ async function doRebuildGraph(
           built.outgoingCallsByFile,
           built.rustBindingsByFile,
           built.rustCrateRootByFile,
+          built.rustInlineScopedCalls,
         );
 
         progress.phase = "persisting symbols";
@@ -816,6 +817,12 @@ export async function buildCodeGraph(
   rustBindingsByFile: Map<string, RustUseBinding[]>;
   /** Rust file → its crate's directory prefix. Resolution input only. */
   rustCrateRootByFile: Map<string, string>;
+  /**
+   * The call edges whose qualifier is rooted in an inline `mod` — a scope with
+   * no file to name. Resolution leaves them unresolved. Held by identity, so
+   * nothing about it reaches an edge or the store.
+   */
+  rustInlineScopedCalls: Set<SymbolEdge>;
 }> {
   ensureDynamicLanguages();
 
@@ -839,6 +846,7 @@ export async function buildCodeGraph(
   const symbolsByFile = new Map<string, SymbolNode[]>();
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
   const rustBindingsByFile = new Map<string, RustUseBinding[]>();
+  const rustInlineScopedCalls = new Set<SymbolEdge>();
 
   // Per-reason counts, holding only the reasons that actually fired — the build log
   // emits `skipReasons` straight from this map, so it never carries a zero.
@@ -1080,7 +1088,14 @@ export async function buildCodeGraph(
     try {
       const extracted = extractSymbolsAndCalls(source, extractionLang, ext, relPath);
       symbolsByFile.set(relPath, extracted.symbols);
-      outgoingCallsByFile.set(relPath, rawCallsToUnresolvedEdges(extracted.rawCalls));
+      const edges = rawCallsToUnresolvedEdges(extracted.rawCalls);
+      outgoingCallsByFile.set(relPath, edges);
+      // One edge per raw call, in order, so the call at `i` is the edge at `i`.
+      // The flag stays out of the edge itself: it is resolution's business and
+      // the store must not grow a field for it.
+      for (let i = 0; i < extracted.rawCalls.length; i++) {
+        if (extracted.rawCalls[i].qualifierRootedInInlineMod) rustInlineScopedCalls.add(edges[i]);
+      }
       if (extracted.bindings && extracted.bindings.length > 0) {
         rustBindingsByFile.set(relPath, extracted.bindings);
       }
@@ -1179,5 +1194,6 @@ export async function buildCodeGraph(
     outgoingCallsByFile,
     rustBindingsByFile,
     rustCrateRootByFile,
+    rustInlineScopedCalls,
   };
 }
