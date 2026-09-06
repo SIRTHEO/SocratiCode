@@ -99,6 +99,29 @@ pub fn go() -> u32 {
 }
 `);
     write("crates/alpha/src/config.rs", "pub fn load() -> u32 { 3 }\n");
+    // ── One directory holding a library and a binary, which is two crates ──
+    // `crate::` in `main.rs` is the binary's own root, and answering with the
+    // library is a different file. Cargo gives `src/bin/x.rs` a crate too.
+    write("tool/Cargo.toml", '[package]\nname = "tool"\nedition = "2021"\n');
+    write("tool/src/lib.rs", "pub mod shared;\n\npub fn helper() -> u32 { 10 }\n");
+    write("tool/src/shared.rs", "pub fn f() -> u32 { 11 }\n");
+    write("tool/src/main.rs", `mod cli;
+
+pub fn helper() -> u32 { 12 }
+
+fn main() {
+    let _ = crate::helper();
+    let _ = cli::run();
+}
+`);
+    write("tool/src/cli.rs", "pub fn run() -> u32 { crate::helper() }\n");
+    write("tool/src/bin/x.rs", `pub fn helper() -> u32 { 13 }
+
+fn main() {
+    let _ = crate::helper();
+}
+`);
+
     write("crates/alpha/inner/beta/Cargo.toml", '[package]\nname = "beta"\nedition = "2021"\n');
     write("crates/alpha/inner/beta/src/lib.rs", "pub mod config;\n");
     write("crates/alpha/inner/beta/src/config.rs", "pub fn load() -> u32 { 4 }\n");
@@ -123,6 +146,28 @@ pub fn go() -> u32 {
     // reach the same file — not the caller's own scope, which answers nothing.
     expect(await candidatesOf("src/deep/inner.rs", "helper", "root")).toEqual([
       "src/lib.rs::helper#5",
+    ]);
+  });
+
+  it("reads `crate::` in a binary as the binary's own root", async () => {
+    // `tool/src/lib.rs` declares a `helper` too, and is what taking the first
+    // root module in the directory answers with — another file, as `unique`.
+    expect(await candidatesOf("tool/src/main.rs", "helper", "crate")).toEqual([
+      "tool/src/main.rs::helper#3",
+    ]);
+  });
+
+  it("gives a `src/bin` file a crate root of its own", async () => {
+    expect(await candidatesOf("tool/src/bin/x.rs", "helper", "crate")).toEqual([
+      "tool/src/bin/x.rs::helper#1",
+    ]);
+  });
+
+  it("follows the root that reaches the caller when a directory holds two", async () => {
+    // `cli.rs` is declared by `main.rs` alone, so `crate::` there is the
+    // binary — which the library's own `helper` must not answer.
+    expect(await candidatesOf("tool/src/cli.rs", "helper", "crate")).toEqual([
+      "tool/src/main.rs::helper#3",
     ]);
   });
 

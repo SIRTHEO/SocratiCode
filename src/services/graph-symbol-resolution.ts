@@ -238,22 +238,63 @@ export function resolveCallSites(
     return candidates.filter((c) => dependents.has(c));
   }
 
-  /**
-   * The file a `crate::` path starts from: the crate's own root module.
-   *
-   * The manifests give the crate's directory; the root module is `lib.rs` or
-   * `main.rs` in it, with or without a `src/`, and it is a file this project
-   * extracted or it is nothing. `null` leaves `crate::` reading the caller's
-   * own scope, which is what it did before the crate map existed.
-   */
-  function crateRootFileOf(callerFile: string): string | null {
-    const prefix = rustCrateRootByFile?.get(callerFile);
-    if (prefix === undefined) return null;
-    for (const name of ["src/lib.rs", "src/main.rs", "lib.rs", "main.rs"]) {
-      const candidate = `${prefix}${name}`;
-      if (symbolsByFile.has(candidate)) return candidate;
+  /** The root modules of one crate directory, in the order Cargo looks. */
+  const rootFilesByCratePrefix = new Map<string, string[]>();
+  /** What a root module reaches, followed once per root that needs asking. */
+  const reachedFromRoot = new Map<string, Set<string>>();
+
+  function reachedFrom(root: string): Set<string> {
+    const known = reachedFromRoot.get(root);
+    if (known) return known;
+    const seen = new Set<string>([root]);
+    const queue = [root];
+    while (queue.length > 0) {
+      const file = queue.pop() as string;
+      for (const dep of depsByFile.get(file) ?? []) {
+        if (!seen.has(dep)) {
+          seen.add(dep);
+          queue.push(dep);
+        }
+      }
     }
-    return null;
+    reachedFromRoot.set(root, seen);
+    return seen;
+  }
+
+  /**
+   * The files a `crate::` path starts from: the crate's own root modules.
+   *
+   * The manifests give the crate's directory, and the root module is `lib.rs`
+   * or `main.rs` in it, with or without a `src/`. One directory can hold two
+   * of them, and then it holds two crates: `crate::` written in `main.rs`
+   * means the binary, and answering with the library is a different file, not
+   * a wider one. So a root module is its own `crate::`, a file under
+   * `src/bin/` is a root module of its own, and where a crate has more than
+   * one root the answer is the roots that actually reach the caller — all of
+   * them when the graph cannot tell, which is an honest ambiguity rather than
+   * a guess.
+   *
+   * Empty leaves `crate::` reading the caller's own scope, which is what it
+   * did before the crate map existed.
+   */
+  function crateRootFilesOf(callerFile: string): string[] {
+    const prefix = rustCrateRootByFile?.get(callerFile);
+    if (prefix === undefined) return [];
+    let roots = rootFilesByCratePrefix.get(prefix);
+    if (!roots) {
+      roots = ["src/lib.rs", "src/main.rs", "lib.rs", "main.rs"]
+        .map((name) => `${prefix}${name}`)
+        .filter((file) => symbolsByFile.has(file));
+      rootFilesByCratePrefix.set(prefix, roots);
+    }
+    // Cargo gives every `src/bin/x.rs` a crate of its own, and a root module
+    // is trivially its own root.
+    if (callerFile.startsWith(`${prefix}src/bin/`) || roots.includes(callerFile)) {
+      return [callerFile];
+    }
+    if (roots.length <= 1) return roots;
+    const reaching = roots.filter((root) => reachedFrom(root).has(callerFile));
+    return reaching.length > 0 ? reaching : roots;
   }
 
   /**
@@ -432,13 +473,15 @@ export function resolveCallSites(
       // is found through the caller's `watch.rs` and never through the root,
       // which only declares `sync`. Both sides are inside the same crate, and
       // the confinement below still applies to both.
-      const root = crateRootFileOf(callerFile);
-      if (root) {
-        homes = [root];
-        scopeDeps = [...new Set([root, ...(depsByFile.get(root) ?? []), ...deps])];
+      const roots = crateRootFilesOf(callerFile);
+      if (roots.length > 0) {
+        homes = roots;
+        scopeDeps = [
+          ...new Set([...roots, ...roots.flatMap((r) => depsByFile.get(r) ?? []), ...deps]),
+        ];
       }
       // `crate::helper()` names the root module itself.
-      if (rest.length === 0) return root ? [root] : null;
+      if (rest.length === 0) return roots.length > 0 ? roots : null;
     } else {
       // An imported binding rewrites the head into the path it names, so
       // `use crate::a::Type as Alias` makes `Alias::method()` reach exactly
@@ -450,13 +493,19 @@ export function resolveCallSites(
         // `root::helper()` mean `crate::helper()`, and reading it in the
         // caller's own scope would answer nothing where the plain spelling
         // answers the crate root.
-        let boundRoot: string | null = null;
+        let boundRoots: string[] = [];
         if (bound[0] === "crate") {
           inOwnCrate = true;
-          boundRoot = crateRootFileOf(callerFile);
-          if (boundRoot) {
-            homes = [boundRoot];
-            scopeDeps = [...new Set([boundRoot, ...(depsByFile.get(boundRoot) ?? []), ...deps])];
+          boundRoots = crateRootFilesOf(callerFile);
+          if (boundRoots.length > 0) {
+            homes = boundRoots;
+            scopeDeps = [
+              ...new Set([
+                ...boundRoots,
+                ...boundRoots.flatMap((r) => depsByFile.get(r) ?? []),
+                ...deps,
+              ]),
+            ];
           }
         }
         if (bound[0] === "super") {
@@ -477,7 +526,7 @@ export function resolveCallSites(
           const head = bound[0] === "crate" || bound[0] === "self" ? bound.slice(1) : bound;
           rest = [...head, ...segments.slice(1)];
           // `use crate as root;` binds the crate root itself.
-          if (rest.length === 0) return boundRoot ? [boundRoot] : null;
+          if (rest.length === 0) return boundRoots.length > 0 ? boundRoots : null;
         }
       }
     }
