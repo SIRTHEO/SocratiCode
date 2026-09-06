@@ -123,7 +123,7 @@ Restart your host. With the default local configuration, first use pulls the req
 
 **First time on a project:** ask your AI: **"Index this codebase"**. Indexing runs in the background; ask **"What is the codebase index status?"** to monitor progress. Depending on codebase size and whether you're using GPU-accelerated Ollama or cloud embeddings, first-time indexing can take anywhere from a few seconds to a few minutes (it takes under 10 minutes to first-index +3 million lines of code on a Macbook Pro M4). Once complete it doesn't need to be run again, you can search, explore the dependency graph, and query context artifacts.
 
-**Every time after that:** just use the tools (search, graph, etc.). By default, on server startup SocratiCode automatically detects previously indexed projects, restarts the file watcher, and runs an incremental update to catch any changes made while the server was down. If indexing was interrupted, it resumes automatically from the last checkpoint. You can also explicitly start or restart the watcher with `codebase_watch { action: "start" }`.
+**Every time after that:** just use the tools (search, graph, etc.). By default, server startup resumes the indexed project represented by the MCP process's working directory: a complete index gets its watcher and an incremental catch-up update, while interrupted indexing resumes from the last checkpoint. `SOCRATICODE_AUTO_RESUME_PROJECTS` and `SOCRATICODE_AUTO_RESUME=all` can select additional projects. A completed indexed project not handled at startup gets a fallback watcher start on its first search, status, or graph interaction. You can also explicitly start or restart the watcher with `codebase_watch { action: "start" }`.
 
 **Prefer a deliberate index snapshot?** Set `SOCRATICODE_WATCHER=off` and `SOCRATICODE_AUTO_RESUME=off` for every MCP process that uses the checkout, then run `codebase_update` only when you want to refresh it. Existing indexes remain usable without rebuilding. Use `SOCRATICODE_WATCHER=manual` instead if explicit `codebase_watch { action: "start" }` should remain available. See [Indexing Behaviour](#indexing-behaviour) and [Passing env vars by host](#passing-env-vars-by-host).
 
@@ -574,8 +574,8 @@ On VS Code's 2.45M‑line codebase, SocratiCode answers architectural questions 
 - **Configurable infrastructure** — All ports, hosts, and API keys are configurable via environment variables. Qdrant API key support for enterprise deployments.
 - **Enterprise-ready simplicity** — No agent coordination tuning, no memory limit environment variables, no coordinator/conductor capacity knobs, no backpressure configuration. SocratiCode scales by relying on production-grade infrastructure (Qdrant, proven embedding APIs) rather than complex in-process orchestration.
 - **Auto-setup & zero configuration** — Just install the Claude Plugin/Skill or add the MCP server to your AI host config. On first use, the server automatically checks Docker, pulls images, starts Qdrant and Ollama containers, and downloads the embedding model. No config files, YAML, environment variables, or required native compilation. The optional GDScript parser falls back safely when no compatible native build is available. Works everywhere Docker runs.
-- **Session resume** — By default, when reopening a previously indexed project, the file watcher starts automatically on first tool use (search, status, update, or graph query). It catches any changes made since the last session and keeps the index live — no manual action needed.
-- **Auto-start watcher** — In the default `SOCRATICODE_WATCHER=auto` mode, the file watcher starts after `codebase_index`, after `codebase_update`, and on the first search, status, or graph interaction. `manual` permits only an explicit `codebase_watch { action: "start" }`; `off` disables watcher startup completely.
+- **Session resume** — By default, server startup resumes the indexed project represented by the MCP process's working directory. Complete indexes get a watcher plus an incremental catch-up update; interrupted indexes resume from the last checkpoint. Explicit project lists and `SOCRATICODE_AUTO_RESUME=all` extend this to other indexed projects.
+- **Auto-start watcher** — In the default `SOCRATICODE_WATCHER=auto` mode, the file watcher starts during startup resume and after `codebase_index` or `codebase_update`. A completed indexed project not selected at startup gets a fallback watcher start on its first search, status, or graph interaction. `manual` permits only an explicit `codebase_watch { action: "start" }`; `off` disables watcher startup completely.
 - **Manual index snapshots** — `SOCRATICODE_WATCHER=off` plus `SOCRATICODE_AUTO_RESUME=off` prevents implicit code-index updates, embeddings, and graph creation. Existing code indexes and graphs stay readable; refresh them explicitly with `codebase_index`, `codebase_update`, or `codebase_graph_build`.
 - **Auto-build code graph** — The code dependency graph is automatically built after indexing and rebuilt when watched files change. No need to call `codebase_graph_build` manually unless you want to force a rebuild.
 - **Multi-agent collaboration** — Multiple AI agents (each running their own MCP instance) can work on the same codebase simultaneously and share a single index. One agent triggers indexing, all agents search against the same data. Only one watcher runs per project — every agent benefits from real-time updates. Cross-process file locking coordinates indexing and watching automatically. Ideal for workflows like one agent writing tests while another fixes code, or a planning agent and an implementation agent working in parallel.
@@ -1677,9 +1677,12 @@ multiple sessions across hours or days, and no work is ever repeated or lost.
 
 ### I reopened my project but new/changed files aren't showing up in search results.
 
-In the default `SOCRATICODE_WATCHER=auto` mode, the file watcher auto-starts on first tool use for any previously indexed project. When it
-starts, it catches up all files modified while SocratiCode was down before watching for
-future changes.
+In the default `SOCRATICODE_WATCHER=auto` mode, server startup resumes the indexed project
+represented by the MCP process's working directory. It starts the watcher and catches up all
+files modified while SocratiCode was down before watching for future changes. Use
+`SOCRATICODE_AUTO_RESUME_PROJECTS` or `SOCRATICODE_AUTO_RESUME=all` to select additional
+projects at startup. A completed indexed project not selected at startup gets the same
+watcher-start fallback on its first search, status, or graph interaction.
 
 If you want to force an immediate catch-up before searching, ask your AI to *"start watching
 this project"* or *"update the index"* — both run an incremental update synchronously and

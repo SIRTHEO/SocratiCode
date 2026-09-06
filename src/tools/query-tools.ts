@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
 import { collectionName, projectIdFromPath, resolveLinkedCollections } from "../config.js";
+import type { WatcherMode } from "../constants.js";
 import { getWatcherMode, SEARCH_DEFAULT_LIMIT, SEARCH_MIN_SCORE, SOCRATICODE_VERSION } from "../constants.js";
 import { getGraphStatus, isGraphBuilderStale } from "../services/code-graph.js";
 import { getArtifactStatusSummary } from "../services/context-artifacts.js";
@@ -53,6 +54,66 @@ function formatProgressLines(progress: IndexingProgress): {
   return { elapsed, pct, progressLine, batchLine, graphLine };
 }
 
+/** Append the current watcher policy and activity state to a tool response. */
+async function appendWatcherState(
+  lines: string[],
+  resolvedPath: string,
+  watcherMode: WatcherMode,
+  context: "search" | "status",
+): Promise<void> {
+  const watchedHere = isWatching(resolvedPath);
+  const watchedAnywhere = watchedHere || await isWatchedByAnyProcess(resolvedPath);
+  const watcherLines: string[] = [];
+
+  if (context === "search") {
+    if (watcherMode === "off") {
+      if (watchedHere) {
+        watcherLines.push("⚠ WARNING: File watching is disabled in this process, but this process still has an active watcher.");
+        watcherLines.push("  Restart the MCP server to apply the changed environment setting.");
+      } else if (watchedAnywhere) {
+        watcherLines.push("⚠ WARNING: File watching is disabled in this process, but another active watcher can still update the shared index.");
+        watcherLines.push("  Set SOCRATICODE_WATCHER=off for every MCP process that uses this checkout.");
+      } else {
+        watcherLines.push("ℹ INDEX SNAPSHOT: File watching is disabled by SOCRATICODE_WATCHER=off.");
+        watcherLines.push("  Results reflect the last explicit codebase_index or codebase_update.");
+      }
+    } else if (watcherMode === "manual") {
+      if (!watchedAnywhere) {
+        watcherLines.push("ℹ INDEX SNAPSHOT: Automatic file watching is disabled by SOCRATICODE_WATCHER=manual.");
+        watcherLines.push("  Run codebase_update to refresh, or start the watcher explicitly with codebase_watch.");
+      } else if (!watchedHere) {
+        watcherLines.push("ℹ NOTE: Another MCP process is watching this project, so the shared index may still update automatically.");
+      }
+    } else if (!watchedAnywhere) {
+      watcherLines.push("⚠ WARNING: File watcher is not yet active for this project. Results may be stale.");
+      watcherLines.push("  The watcher is being started automatically. Run codebase_update to force an immediate catch-up.");
+    }
+  } else if (watcherMode === "off") {
+    watcherLines.push("File watcher: disabled (SOCRATICODE_WATCHER=off)");
+    if (watchedHere) {
+      watcherLines.push("  Warning: this process still has an active watcher. Restart the MCP server to apply the changed environment setting.");
+    } else if (watchedAnywhere) {
+      watcherLines.push("  Warning: another MCP process is watching this project. Set SOCRATICODE_WATCHER=off for every process that uses this checkout.");
+    }
+  } else if (watchedHere) {
+    watcherLines.push(watcherMode === "manual"
+      ? "File watcher: active (started explicitly; SOCRATICODE_WATCHER=manual)"
+      : "File watcher: active (auto-updating on changes)");
+  } else if (watchedAnywhere) {
+    watcherLines.push(watcherMode === "manual"
+      ? "File watcher: active (watched by another process; automatic startup disabled here)"
+      : "File watcher: active (watched by another process)");
+  } else {
+    watcherLines.push(watcherMode === "manual"
+      ? "File watcher: inactive (SOCRATICODE_WATCHER=manual; start explicitly or run codebase_update to refresh)"
+      : "File watcher: inactive");
+  }
+
+  if (watcherLines.length > 0) {
+    lines.push("", ...watcherLines);
+  }
+}
+
 export async function handleQueryTool(
   name: string,
   args: Record<string, unknown>,
@@ -92,10 +153,20 @@ export async function handleQueryTool(
       const filteredCount = allResults.length - results.length;
 
       if (results.length === 0) {
+        const lines: string[] = [];
         if (filteredCount > 0) {
-          return `No results above score threshold ${minScore.toFixed(2)} for "${query}" in project ${resolvedPath}.\n${filteredCount} result${filteredCount === 1 ? " was" : "s were"} below the threshold. Try a broader query or lower the minScore parameter.`;
+          lines.push(
+            `No results above score threshold ${minScore.toFixed(2)} for "${query}" in project ${resolvedPath}.`,
+            `${filteredCount} result${filteredCount === 1 ? " was" : "s were"} below the threshold. Try a broader query or lower the minScore parameter.`,
+          );
+        } else {
+          lines.push(
+            `No results found for "${query}" in project ${resolvedPath}.`,
+            "Make sure the project has been indexed first using codebase_index.",
+          );
         }
-        return `No results found for "${query}" in project ${resolvedPath}.\nMake sure the project has been indexed first using codebase_index.`;
+        await appendWatcherState(lines, resolvedPath, watcherMode, "search");
+        return lines.join("\n");
       }
 
       const lines = [`Search results for "${query}" (${results.length} matches):\n`];
@@ -114,27 +185,7 @@ export async function handleQueryTool(
         }
       }
 
-      const watchedHere = isWatching(resolvedPath);
-      const watchedAnywhere = watchedHere || await isWatchedByAnyProcess(resolvedPath);
-      if (watcherMode === "off") {
-        if (watchedAnywhere) {
-          lines.push("⚠ WARNING: File watching is disabled in this process, but another active watcher can still update the shared index.");
-          lines.push("  Set SOCRATICODE_WATCHER=off for every MCP process that uses this checkout.\n");
-        } else {
-          lines.push("ℹ INDEX SNAPSHOT: File watching is disabled by SOCRATICODE_WATCHER=off.");
-          lines.push("  Results reflect the last explicit codebase_index or codebase_update.\n");
-        }
-      } else if (watcherMode === "manual") {
-        if (!watchedAnywhere) {
-          lines.push("ℹ INDEX SNAPSHOT: Automatic file watching is disabled by SOCRATICODE_WATCHER=manual.");
-          lines.push("  Run codebase_update to refresh, or start the watcher explicitly with codebase_watch.\n");
-        } else if (!watchedHere) {
-          lines.push("ℹ NOTE: Another MCP process is watching this project, so the shared index may still update automatically.\n");
-        }
-      } else if (!watchedAnywhere) {
-        lines.push("\u26a0 WARNING: File watcher is not yet active for this project. Results may be stale.");
-        lines.push("  The watcher is being started automatically. Run codebase_update to force an immediate catch-up.\n");
-      }
+      await appendWatcherState(lines, resolvedPath, watcherMode, "search");
 
       for (const r of results) {
         const projectTag = r.project ? ` [${r.project}]` : "";
@@ -159,7 +210,7 @@ export async function handleQueryTool(
           const progress = getIndexingProgress(resolvedPath);
           if (progress) {
             const { elapsed, progressLine, batchLine, graphLine } = formatProgressLines(progress);
-            return [
+            const lines = [
               `Project: ${resolvedPath}`,
               "",
               `\u26a0 ${progress.type === "full-index" ? "Full index" : "Incremental update"} in progress`,
@@ -171,10 +222,14 @@ export async function handleQueryTool(
               graphLine,
               "",
               "Qdrant is starting up. Keep calling codebase_status to check progress.",
-            ].join("\n");
+            ];
+            await appendWatcherState(lines, resolvedPath, watcherMode, "status");
+            return lines.join("\n");
           }
         }
-        return "Qdrant is not available. Run codebase_index first to set up infrastructure.";
+        const lines = ["Qdrant is not available. Run codebase_index first to set up infrastructure."];
+        await appendWatcherState(lines, resolvedPath, watcherMode, "status");
+        return lines.join("\n");
       }
 
       const info = await getCollectionInfo(collection);
@@ -185,7 +240,7 @@ export async function handleQueryTool(
           const progress = getIndexingProgress(resolvedPath);
           if (progress) {
             const { elapsed, progressLine, batchLine, graphLine } = formatProgressLines(progress);
-            return [
+            const lines = [
               `Project: ${resolvedPath}`,
               "",
               `\u26a0 ${progress.type === "full-index" ? "Full index" : "Incremental update"} in progress`,
@@ -197,10 +252,17 @@ export async function handleQueryTool(
               graphLine,
               "",
               "Index is being created. Keep calling codebase_status to check progress.",
-            ].join("\n");
+            ];
+            await appendWatcherState(lines, resolvedPath, watcherMode, "status");
+            return lines.join("\n");
           }
         }
-        return `No index found for project: ${resolvedPath}\nRun codebase_index to create one.`;
+        const lines = [
+          `No index found for project: ${resolvedPath}`,
+          "Run codebase_index to create one.",
+        ];
+        await appendWatcherState(lines, resolvedPath, watcherMode, "status");
+        return lines.join("\n");
       }
 
       const metadata = await getProjectMetadata(collection);
@@ -291,32 +353,7 @@ export async function handleQueryTool(
         }
       }
 
-      const watchedHere = isWatching(resolvedPath);
-      const watchedAnywhere = watchedHere || await isWatchedByAnyProcess(resolvedPath);
-      if (watcherMode === "off") {
-        statusLines.push("");
-        statusLines.push("File watcher: disabled (SOCRATICODE_WATCHER=off)");
-        if (watchedHere) {
-          statusLines.push("  Warning: this process still has an active watcher. Restart the MCP server to apply the changed environment setting.");
-        } else if (watchedAnywhere) {
-          statusLines.push("  Warning: another MCP process is watching this project. Set SOCRATICODE_WATCHER=off for every process that uses this checkout.");
-        }
-      } else if (watchedHere) {
-        statusLines.push("");
-        statusLines.push(watcherMode === "manual"
-          ? "File watcher: active (started explicitly; SOCRATICODE_WATCHER=manual)"
-          : "File watcher: active (auto-updating on changes)");
-      } else if (watchedAnywhere) {
-        statusLines.push("");
-        statusLines.push(watcherMode === "manual"
-          ? "File watcher: active (watched by another process; automatic startup disabled here)"
-          : "File watcher: active (watched by another process)");
-      } else {
-        statusLines.push("");
-        statusLines.push(watcherMode === "manual"
-          ? "File watcher: inactive (SOCRATICODE_WATCHER=manual; start explicitly or run codebase_update to refresh)"
-          : "File watcher: inactive");
-      }
+      await appendWatcherState(statusLines, resolvedPath, watcherMode, "status");
 
       // Graph status
       try {
