@@ -40,7 +40,39 @@ describe("Rust `super::` written inside an inline mod", () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-rust-inline-mod-"));
 
     write("Cargo.toml", '[package]\nname = "inlinemod"\nedition = "2021"\n');
-    write("src/lib.rs", "pub mod a;\npub mod sub;\n");
+    // The crate root reaches `a::c` by naming modules, and `only_inside` is
+    // not in `c`'s own module — it is in `c`'s inline `mod holder`. rustc:
+    // `error[E0425]: cannot find function only_inside in module crate::a::c`.
+    write(
+      "src/lib.rs",
+      `pub mod a;
+pub mod sub;
+pub mod tipo;
+
+pub fn from_root() -> u32 { crate::a::c::only_inside() }
+`,
+    );
+    // The same reach written as `super::`, from a sibling of `c`. Same module,
+    // same refusal — the spelling of the path is not what decides it.
+    write("src/tipo.rs", `pub fn from_sibling() -> u32 { super::a::c::only_inside() }
+
+#[cfg(test)]
+mod tests {
+    pub struct Local;
+
+    impl Local {
+        pub fn make() -> u32 { 7 }
+    }
+
+    // Written outside the assert: a macro body is one token tree, so a call
+    // inside it is never extracted at all.
+    #[test]
+    fn reaches_its_own_inline_type() {
+        let got = Local::make();
+        assert_eq!(got, 7);
+    }
+}
+`);
     write("src/sub.rs", "pub fn f() -> u32 { 1 }\npub fn h() -> u32 { 8 }\n");
     write("src/a.rs", `pub mod b;
 pub mod c;
@@ -169,7 +201,7 @@ mod tests {
         .filter((s) => s.name !== "<module>")
         .map((s) => s.id);
     qualified = new Map();
-    for (const file of ["src/a/b.rs", "src/a/c.rs", "src/a/d.rs"]) {
+    for (const file of ["src/a/b.rs", "src/a/c.rs", "src/a/d.rs", "src/lib.rs", "src/tipo.rs"]) {
       for (const edge of graph.outgoingCallsByFile.get(file) ?? []) {
         if (!edge.calleeQualifier) continue;
         const caller = edge.callerId.split("::").pop()?.split("#")[0] ?? "";
@@ -309,5 +341,45 @@ mod tests {
     const edge = edgeFor("fewer_hops_than_modules", "super::inner", "probe");
     expect(edge.calleeCandidates).toEqual([]);
     expect(edge.confidence).toBe("unresolved");
+  });
+
+  it("refuses an inline-mod symbol reached through `crate::`, not only `self`", () => {
+    // The rule is the path, not the spelling. `crate::a::c` names `c`'s own
+    // module, and `only_inside` is declared in `c`'s inline `mod holder` —
+    // cargo 1.98 on this shape: `error[E0425]: cannot find function
+    // only_inside in module crate::a::c`.
+    //
+    // The file is the scope this resolution has, so the id comes back with the
+    // rest; refusing it is what keeps a `unique` off a symbol Rust cannot call
+    // from here. Before this, the filter asked whether the qualifier was
+    // literally `self`, and every other spelling of the same reach answered
+    // `unique`.
+    const edge = edgeFor("from_root", "crate::a::c", "only_inside");
+    expect(edge.calleeCandidates).toEqual([]);
+    expect(edge.confidence).toBe("unresolved");
+  });
+
+  it("refuses it through `super::` too", () => {
+    // Same module reached by climbing instead of by rooting. A rule written
+    // per spelling would need one branch per spelling, and would keep missing
+    // the next one.
+    const edge = edgeFor("from_sibling", "super::a::c", "only_inside");
+    expect(edge.calleeCandidates).toEqual([]);
+    expect(edge.confidence).toBe("unresolved");
+  });
+
+  it("still reaches a type an inline mod declares, from inside that mod", () => {
+    // The other side, and the reason the refusal follows the path rather than
+    // the symbol: `Local` is declared inside `mod tests` and `Local::make()`
+    // is written inside the same `mod`, where Rust does reach it — cargo 1.98
+    // runs this fixture's assertion green. A bare type qualifier is not a
+    // module path, so nothing is dropped from it; refusing here would turn a
+    // correct `unique` into `unresolved`.
+    // `local` because the symbol is in the caller's own file, which is what
+    // that label has always meant here — what is under test is the candidate,
+    // which must still be there.
+    const edge = edgeFor("reaches_its_own_inline_type", "Local", "make");
+    expect(edge.calleeCandidates).toEqual(["src/tipo.rs::make#8"]);
+    expect(edge.confidence).toBe("local");
   });
 });

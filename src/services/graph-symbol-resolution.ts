@@ -599,12 +599,27 @@ export function resolveCallSites(
    * names: a different scope, not a wider one, and the only way to answer a
    * path that points out of the caller's.
    */
+  /**
+   * A qualifier's scope, and how the qualifier reached it.
+   *
+   * `viaModulePath` is true when the files were reached by naming modules —
+   * `crate::a`, `super::a`, `self`, a bare `a::b`, or the module prefix of a
+   * type qualifier. That is the case where an inline `mod` inside the answer
+   * is *not* reachable: `crate::a::f()` names `a`'s own module, and an `f`
+   * declared inside `mod holder { }` in `a.rs` needs `crate::a::holder::f()`,
+   * which is a different path. rustc says so with E0425.
+   *
+   * It is false when the qualifier is a bare type — `T::method()`, `Self::` —
+   * because the type may be declared inside the very inline `mod` the call is
+   * written in, and there Rust does reach it.
+   */
   function rustQualifierScope(
     callerFile: string,
     qualifier: string,
     deps: string[],
     bindings: RustUseBinding[],
-  ): string[] | null {
+  ): { files: string[]; viaModulePath: boolean } | null {
+    const asPath = (files: string[]) => ({ files, viaModulePath: true });
     const segments = qualifier.split("::").map((s) => s.trim()).filter(Boolean);
     if (segments.length === 0) return null;
 
@@ -624,7 +639,12 @@ export function resolveCallSites(
     let homes = [callerFile];
     let scopeDeps = deps;
     if (segments[0] === "self" || segments[0] === "Self") {
-      if (segments.length === 1) return [callerFile];
+      // `self` is the file's own module; `Self` is the implementing type, and
+      // a type can be declared inside the inline `mod` the call sits in. Only
+      // the first is a module path.
+      if (segments.length === 1) {
+        return { files: [callerFile], viaModulePath: segments[0] === "self" };
+      }
       rest = segments.slice(1);
     } else if (segments[0] === "super") {
       const climbed = climbSuper(callerFile, segments);
@@ -632,7 +652,7 @@ export function resolveCallSites(
       homes = climbed.homes;
       scopeDeps = climbed.deps;
       rest = climbed.rest;
-      if (rest.length === 0) return homes;
+      if (rest.length === 0) return asPath(homes);
     } else if (segments[0] === "crate") {
       rest = segments.slice(1);
       // Confined to the caller's own crate, which is what `crate::` means.
@@ -660,7 +680,7 @@ export function resolveCallSites(
         ];
       }
       // `crate::helper()` names the root module itself.
-      if (rest.length === 0) return roots;
+      if (rest.length === 0) return roots ? asPath(roots) : null;
     } else {
       // An imported binding rewrites the head into the path it names, so
       // `use crate::a::Type as Alias` makes `Alias::method()` reach exactly
@@ -703,12 +723,12 @@ export function resolveCallSites(
           rest = [...climbed.rest, ...segments.slice(1)];
           // `use super as up;` binds the parent itself, so `up::f()` is a call
           // into the parent — the same answer `super::f()` gets.
-          if (rest.length === 0) return homes;
+          if (rest.length === 0) return asPath(homes);
         } else {
           const head = bound[0] === "crate" || bound[0] === "self" ? bound.slice(1) : bound;
           rest = [...head, ...segments.slice(1)];
           // `use crate as root;` binds the crate root itself.
-          if (rest.length === 0) return boundRoots;
+          if (rest.length === 0) return boundRoots ? asPath(boundRoots) : null;
         }
       }
     }
@@ -762,7 +782,7 @@ export function resolveCallSites(
 
     // A module path, walked segment by segment from the scope it starts in.
     const byPath = modulePathFiles(rest);
-    if (byPath.length > 0) return byPath;
+    if (byPath.length > 0) return asPath(byPath);
 
     // A type qualifier: the files, within reach, that declare that name. The
     // last segment is the type — `crate::a::Type::method()` qualifies `method`
@@ -795,7 +815,13 @@ export function resolveCallSites(
         if (declaredIn) declaring.add(declaredIn);
       }
     }
-    if (declaring.size > 0) return [...declaring];
+    // A type named through a module prefix was reached by walking modules, so
+    // an inline `mod` in the answer is out of reach exactly as it is for a
+    // plain module path. A bare `T::method()` was not: `T` can be declared in
+    // the very inline `mod` the call sits in, and there Rust reaches it.
+    if (declaring.size > 0) {
+      return { files: [...declaring], viaModulePath: modulePrefix.length > 0 };
+    }
 
     return null;
   }
@@ -820,29 +846,34 @@ export function resolveCallSites(
           ? null
           : rustQualifierScope(callerFile, edge.calleeQualifier, deps, bindings);
         if (scope) {
-          for (const file of scope) candidates.push(...findSymbolsInTarget(file, edge.calleeName));
+          for (const file of scope.files) {
+            candidates.push(...findSymbolsInTarget(file, edge.calleeName));
+          }
         }
         let uniq = Array.from(new Set(candidates));
-        // `self` is the file's own module, and by the time a qualifier reads
-        // `self` that is provably what it names: the extractor rewrites
-        // `super::helper()` to it only after every inline `mod` the call sits
-        // in has been climbed out of, and refuses a `self::` written inside
-        // one rather than rewriting it.
+        // A path that names modules answers with a module, and from a module
+        // Rust reaches what the file declares at its top level — never what an
+        // inline `mod` inside it encloses. `crate::a::f()` names `a`'s own
+        // module; an `f` written in `mod holder { }` in `a.rs` is
+        // `crate::a::holder::f()`, a different path, and rustc answers E0425
+        // for the first. The scope this resolution has is the file, so those
+        // ids come back with the rest; dropping them is what keeps `unique`
+        // from naming a symbol that is not callable from where the call is
+        // written, and whoever walks the candidates from following it.
         //
-        // From that module Rust reaches the file's top-level declarations, and
-        // not a `helper` an inline `mod` encloses — checked against rustc,
-        // which answers E0425 for `super::helper()` when the only `helper` in
-        // the file is declared inside a sibling inline `mod`. The scope is the
-        // file, so those ids come back with the rest; dropping them is what
-        // keeps `unique` and `local` from naming a symbol that is not callable
-        // from where the call is written, and whoever walks the candidates
-        // from following it.
+        // It follows the *path*, not the spelling: `self`, `super::a`,
+        // `crate::a`, a bare `a::b` and the module prefix of a type qualifier
+        // all reach a module the same way. A bare `T::method()` does not — `T`
+        // can be declared in the very inline `mod` the call sits in, and there
+        // Rust does reach it — so `viaModulePath` says which it was, rather
+        // than the qualifier's first segment. Asking for the spelling `self`
+        // left every other way of reaching the same module answering `unique`.
         //
         // The refusal already in place for a path rooted in an inline `mod`
         // then extends to this one: when nothing survives, the edge keeps its
-        // qualifier and goes unresolved, because the file's top level is the
-        // only scope the path names and it declares nothing of that name.
-        if (edge.calleeQualifier === "self" && rustInlineDeclaredSymbols) {
+        // qualifier and goes unresolved, because the module the path names
+        // declares nothing of that name.
+        if (scope?.viaModulePath && rustInlineDeclaredSymbols) {
           uniq = uniq.filter((id) => !rustInlineDeclaredSymbols.has(id));
         }
         edge.calleeCandidates = uniq;
