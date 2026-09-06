@@ -302,6 +302,10 @@ export const SUPPORTED_EXTENSIONS = new Set([
   ".r", ".R",
   // Dockerfile
   ".dockerfile",
+  // GDScript (Godot)
+  ".gd",
+  // Godot resources (text-based scene/resource files)
+  ".tscn", ".tres",
 ]);
 
 // ── Extra extensions (user-configurable) ─────────────────────────────────
@@ -347,7 +351,6 @@ export const SPECIAL_FILES = new Set([
   ".dockerignore",
 ]);
 
-/** Map file extension to human-readable language name */
 /** Canonical file-extension → language-label map. */
 const EXTENSION_TO_LANGUAGE: Record<string, string> = {
   ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
@@ -375,6 +378,8 @@ const EXTENSION_TO_LANGUAGE: Record<string, string> = {
   ".lua": "lua",
   ".r": "r", ".R": "r",
   ".dockerfile": "dockerfile",
+  ".gd": "gdscript",
+  ".tscn": "godot-resource", ".tres": "godot-resource",
 };
 
 /**
@@ -410,6 +415,8 @@ const LANGUAGE_TO_CANONICAL_EXT: Record<string, string> = {
   css: ".css", scss: ".scss", sass: ".sass", less: ".less", stylus: ".styl",
   vue: ".vue",
   svelte: ".svelte",
+  gdscript: ".gd",
+  "godot-resource": ".tscn",
 };
 
 /**

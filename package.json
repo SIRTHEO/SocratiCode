@@ -98,6 +98,9 @@
     "web-tree-sitter": "^0.26.12",
     "zod": "^3.24.2"
   },
+  "optionalDependencies": {
+    "tree-sitter-gdscript": "6.1.0"
+  },
   "devDependencies": {
     "@biomejs/biome": "^2.4.4",
     "@release-it/conventional-changelog": "^11.0.0",
