@@ -219,6 +219,12 @@ export function resolveCallSites(
    * it: nothing is dropped then, which is what this did before.
    */
   rustInlineDeclaredSymbols?: ReadonlyMap<string, string>,
+  /**
+   * Rust file → every target root declared by its parsed Cargo manifest.
+   * This is in-memory build metadata only. Kept optional and last so existing
+   * callers retain the pre-manifest fallback behaviour.
+   */
+  rustCrateRootsByFile?: ReadonlyMap<string, readonly string[]>,
 ): void {
   // Build a fast lookup: file → Map<symbolName, SymbolNode[]>
   const symbolIndexByFile = new Map<string, Map<string, SymbolNode[]>>();
@@ -445,6 +451,21 @@ export function resolveCallSites(
   function crateRootFilesOf(callerFile: string): string[] | null {
     const prefix = rustCrateRootByFile?.get(callerFile);
     if (prefix === undefined) return null;
+
+    // The manifest parser already knows every target root, including custom
+    // `[lib] path`, `[[bin]] path`, tests, examples, benches and build scripts.
+    // Prefer that authoritative list when it is available. A root is its own
+    // crate; a module belongs to the roots that reach it. When several targets
+    // exist and none reaches the file, choosing any one would manufacture a
+    // cross-target edge, so the honest answer is unresolved.
+    const declaredRoots = rustCrateRootsByFile?.get(callerFile);
+    if (declaredRoots) {
+      if (declaredRoots.includes(callerFile)) return [callerFile];
+      if (declaredRoots.length === 0) return [];
+      const reaching = declaredRoots.filter((root) => reachedFrom(root).has(callerFile));
+      if (reaching.length > 0) return reaching;
+      return declaredRoots.length === 1 ? [...declaredRoots] : [];
+    }
 
     for (const dir of CARGO_TARGET_DIRS) {
       const targetDir = `${prefix}${dir}/`;
@@ -748,8 +769,14 @@ export function resolveCallSites(
         } else {
           const head = bound[0] === "crate" || bound[0] === "self" ? bound.slice(1) : bound;
           rest = [...head, ...segments.slice(1)];
-          // `use crate as root;` binds the crate root itself.
-          if (rest.length === 0) return boundRoots ? asPath(boundRoots) : null;
+          // `use crate as root;` binds the crate root itself; `use self as
+          // this_module;` binds the caller's own module. Neither anchor has a
+          // path segment left after the alias is expanded.
+          if (rest.length === 0) {
+            if (boundRoots) return asPath(boundRoots);
+            if (bound[0] === "self") return asPath(homes);
+            return null;
+          }
         }
       }
     }
@@ -851,26 +878,103 @@ export function resolveCallSites(
     return null;
   }
 
+  /** Cached module paths used to validate crate- and super-rooted re-exports. */
+  const rustModulePathsByFile = new Map<string, string[][]>();
+
+  /** Module paths of `file`, relative to each target root that reaches it. */
+  function rustModulePathsOf(file: string): string[][] {
+    const cached = rustModulePathsByFile.get(file);
+    if (cached) return cached;
+
+    const paths: string[][] = [];
+    const roots = crateRootFilesOf(file) ?? [];
+    for (const root of roots) {
+      if (root === file) {
+        paths.push([]);
+        continue;
+      }
+      const base = childModuleDirOf(root, true);
+      if (base && !file.startsWith(`${base}/`)) continue;
+      const relative = base ? file.slice(base.length + 1) : file;
+      if (!relative.endsWith(".rs")) continue;
+      const segments = relative.slice(0, -3).split("/").filter(Boolean);
+      if (segments.at(-1) === "mod") segments.pop();
+      if (segments.length > 0) paths.push(segments);
+    }
+    rustModulePathsByFile.set(file, paths);
+    return paths;
+  }
+
+  const samePath = (left: string[], right: string[]): boolean =>
+    left.length === right.length && left.every((segment, index) => segment === right[index]);
+
+  /** Whether one top-level binding reads from the inline owner of a symbol. */
+  function bindingReadsInlineOwner(
+    file: string,
+    binding: RustUseBinding,
+    owner: string,
+    name: string,
+  ): boolean {
+    if (binding.local !== "*" && binding.local !== name) return false;
+
+    const target = binding.path.split("::").map((segment) => segment.trim()).filter(Boolean);
+    if (binding.local !== "*") {
+      // An alias of a differently named symbol does not make an unrelated
+      // same-named declaration in this file the re-export's target.
+      if (target.at(-1) !== name) return false;
+      target.pop();
+    }
+
+    const ownerPath = owner.split("::").filter(Boolean);
+    if (ownerPath.length === 0) return false;
+
+    // Without a readable manifest, keep the established best-effort behavior:
+    // explicit uses stay accepted, while a glob must at least name the full
+    // inline owner rather than merely sharing its outermost segment.
+    if (!rustCrateRootsByFile?.has(file)) {
+      if (binding.local !== "*") return true;
+      const unanchored = target[0] === "self" || target[0] === "crate"
+        ? target.slice(1)
+        : target;
+      return unanchored.length >= ownerPath.length &&
+        samePath(unanchored.slice(-ownerPath.length), ownerPath);
+    }
+
+    if (target[0] === "self") return samePath(target.slice(1), ownerPath);
+    if (target[0] !== "crate" && target[0] !== "super") {
+      return samePath(target, ownerPath);
+    }
+
+    const filePaths = rustModulePathsOf(file);
+    const expected = filePaths.map((filePath) => [...filePath, ...ownerPath]);
+    if (target[0] === "crate") {
+      const absolute = target.slice(1);
+      return expected.some((candidate) => samePath(absolute, candidate));
+    }
+
+    let supers = 0;
+    while (target[supers] === "super") supers += 1;
+    const rest = target.slice(supers);
+    return filePaths.some((filePath, index) => {
+      if (supers > filePath.length) return false;
+      const absolute = [...filePath.slice(0, filePath.length - supers), ...rest];
+      return samePath(absolute, expected[index]);
+    });
+  }
+
   /**
    * Whether the top level of the file declaring `id` brings `name` up to
    * itself with a `use`.
    *
    * From a file's own module Rust reaches what the file declares at its top
-   * level *and what the top level imports* — a name a `use` carries there is
-   * as reachable as one written there. `counters.rs` in tokio declares
+   * level and what the top level imports. `counters.rs` in tokio declares
    * `inc_num_inc_notify_local()` inside `mod imp` and then writes
-   * `pub(super) use imp::*;`, so `super::counters::inc_num_inc_notify_local()`
-   * compiles; `ucred.rs` does the same with seven explicit
-   * `pub(crate) use self::impl_<os>::get_peer_cred;`. Refusing those on the
-   * grounds that the symbol sits inside an inline `mod` withdrew 35 answers
-   * that were right.
+   * `pub(super) use imp::*;`; `ucred.rs` does the same with explicit uses.
    *
    * A glob is recorded under `*` and carries the module it reads from, which
-   * is what bounds it: `pub use imp::*;` exports what `imp` exports and
-   * nothing from a sibling `mod altro { … }` in the same file — rustc answers
-   * E0425 for `crate::glob::nascosto()` when `nascosto` is in `altro`. So the
-   * glob's own path has to name the inline `mod` the symbol sits in, and the
-   * outermost one is the one the file's top level can name.
+   * is what bounds it. `pub use imp::*;` exports what `imp` exports, not a
+   * sibling module or a private `imp::hidden` nested beneath it. The complete
+   * inline owner path therefore has to match the binding's source module.
    */
   function reExportedToTopLevel(id: string, name: string): boolean {
     const file = fileOfSymbolId.get(id);
@@ -878,14 +982,8 @@ export function resolveCallSites(
     const declared = rustBindingsByFile?.get(file);
     if (!declared) return false;
     const owner = rustInlineDeclaredSymbols?.get(id);
-    return declared.some((b) => {
-      if (b.local === name) return true;
-      if (b.local !== "*") return false;
-      // `use imp::*;` reads from `imp`; `use self::imp::*;` and
-      // `use crate::a::imp::*;` from the last segment of their path.
-      const from = b.path.split("::").pop();
-      return owner !== undefined && from === owner;
-    });
+    return owner !== undefined &&
+      declared.some((binding) => bindingReadsInlineOwner(file, binding, owner, name));
   }
 
   for (const [callerFile, edges] of outgoingCallsByFile.entries()) {

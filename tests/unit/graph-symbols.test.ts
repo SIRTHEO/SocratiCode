@@ -445,6 +445,7 @@ use crate::a::{Thing, Other as O};
 use std::fs;
 use crate::b::{self, Deep};
 use crate::c::*;
+use self as ThisModule;
 `;
       const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
       const bindings = new Map((out.bindings ?? []).map((b) => [b.local, b.path]));
@@ -455,6 +456,9 @@ use crate::c::*;
       // `self` in a list binds the prefix's own last segment.
       expect(bindings.get("b")).toBe("crate::b");
       expect(bindings.get("Deep")).toBe("crate::b::Deep");
+      // At the file top level, bare `self` names the file's own module. It must
+      // keep that anchor rather than becoming an empty path.
+      expect(bindings.get("ThisModule")).toBe("self");
       // A wildcard binds no name: what it brings in cannot be known from this
       // file, and guessing would widen resolution instead of narrowing it.
       expect(bindings.has("c")).toBe(false);

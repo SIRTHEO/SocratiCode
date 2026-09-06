@@ -57,6 +57,10 @@ pub fn by_glob() -> u32 { crate::glob::only_via_glob() }
 pub fn past_the_glob() -> u32 { crate::glob::nascosto() }
 pub fn by_self_alias() -> u32 { A::helper() }
 use crate::a::{self as A};
+use self as ThisModule;
+pub fn local_helper() -> u32 { 41 }
+pub fn by_bare_self_alias() -> u32 { ThisModule::local_helper() }
+pub fn past_nested_glob() -> u32 { crate::glob::troppo_profondo() }
 `,
     );
     // The two ways a file lifts a name out of its own inline `mod` to its top
@@ -73,6 +77,10 @@ pub(crate) use self::imp::per_nome;
 `);
     write("src/glob.rs", `mod imp {
     pub fn only_via_glob() -> u32 { 31 }
+
+    mod hidden {
+        pub fn troppo_profondo() -> u32 { 33 }
+    }
 }
 
 mod altro {
@@ -445,6 +453,16 @@ mod tests {
     expect(edge.confidence).toBe("unresolved");
   });
 
+  it("does not let a glob flatten a nested inline mod", () => {
+    // `pub use imp::*;` carries the names exported directly by `imp`; it does
+    // not flatten `imp::hidden` into the file's top level. Treating only the
+    // outermost owner as the source makes this look callable when rustc does
+    // not expose it there.
+    const edge = edgeFor("past_nested_glob", "crate::glob", "troppo_profondo");
+    expect(edge.calleeCandidates).toEqual([]);
+    expect(edge.confidence).toBe("unresolved");
+  });
+
   it("reads `use crate::a::{self as A};` as the module, not as `a::self`", () => {
     // Inside a use list, `self` is the module the list hangs off, so the
     // binding names `crate::a`. Recorded literally as `crate::a::self` it
@@ -454,5 +472,12 @@ mod tests {
     const edge = edgeFor("by_self_alias", "A", "helper");
     expect(edge.calleeCandidates).toEqual(["src/a.rs::helper#6"]);
     expect(edge.confidence).toBe("unique");
+  });
+
+  it("reads `use self as ThisModule;` as the file's own module", () => {
+    // A top-level bare `self` is a real anchor, not an empty use path.
+    const edge = edgeFor("by_bare_self_alias", "ThisModule", "local_helper");
+    expect(edge.calleeCandidates).toEqual(["src/lib.rs::local_helper#14"]);
+    expect(edge.confidence).toBe("local");
   });
 });

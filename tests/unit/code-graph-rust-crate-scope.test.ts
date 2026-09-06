@@ -44,6 +44,8 @@ describe("Rust crate scope for `crate::`", () => {
       graph.rustBindingsByFile,
       graph.rustCrateRootByFile,
       graph.rustInlineScopedCalls,
+      graph.rustInlineDeclaredSymbols,
+      graph.rustCrateRootsByFile,
     );
     const edge = (graph.outgoingCallsByFile.get(callerRel) ?? []).find(
       (e) => e.calleeName === name && e.calleeQualifier === qualifier,
@@ -116,13 +118,14 @@ pub fn out_of_the_crate() -> u32 {
     // ── One directory holding a library and a binary, which is two crates ──
     // `crate::` in `main.rs` is the binary's own root, and answering with the
     // library is a different file. Cargo gives `src/bin/x.rs` a crate too.
-    // The two `[[bin]]` entries are targets no convention would find: one
-    // inside `src/bin/` with no `main.rs` beside it, one outside it entirely.
-    // `cargo metadata` lists both (cargo 1.98), and nothing but the manifest
-    // says so — which is why the resolver leaves them unresolved below.
+    // The three `[[bin]]` entries are targets no convention would find: one
+    // inside `src/bin/` with no `main.rs` beside it, two outside it entirely.
+    // `cargo metadata` lists all three (cargo 1.98), and nothing but the
+    // manifest says so. The resolver must therefore carry the parsed target
+    // roots through to `crate::` resolution instead of guessing by filename.
     write(
       "tool/Cargo.toml",
-      '[package]\nname = "tool"\nedition = "2021"\n\n[[bin]]\nname = "custom"\npath = "src/bin/custom/helper.rs"\n\n[[bin]]\nname = "launcher"\npath = "launcher/main.rs"\n',
+      '[package]\nname = "tool"\nedition = "2021"\n\n[[bin]]\nname = "custom"\npath = "src/bin/custom/helper.rs"\n\n[[bin]]\nname = "launcher"\npath = "launcher/main.rs"\n\n[[bin]]\nname = "flat-launcher"\npath = "launcher.rs"\n',
     );
     write("tool/src/lib.rs", "pub mod shared;\n\npub fn helper() -> u32 { 10 }\n");
     write("tool/src/shared.rs", "pub fn f() -> u32 { 11 }\n");
@@ -209,9 +212,18 @@ fn main() {
     let _ = crate::helper();
 }
 `);
-    // A `[[bin]] path` outside every conventional directory. No root reaches
-    // it, and it is named `main.rs`, which `mod x;` never resolves to.
+    // A `[[bin]] path` outside every conventional directory. Only the manifest
+    // identifies it as a target root.
     write("tool/launcher/main.rs", `pub fn helper() -> u32 { 61 }
+
+fn main() {
+    let _ = crate::helper();
+}
+`);
+    // A custom target whose filename has none of Cargo's conventional root
+    // shapes. Before the manifest roots reached resolution, `crate::helper()`
+    // here could be answered from `src/lib.rs` instead.
+    write("tool/launcher.rs", `pub fn helper() -> u32 { 62 }
 
 fn main() {
     let _ = crate::helper();
@@ -219,10 +231,8 @@ fn main() {
 `);
 
     // ── A crate whose root module sits where no convention looks ──────────
-    // `[lib] path` is not read here, so nothing is known about this crate's
-    // roots — which is the same absence of information as having no crate map
-    // at all, and keeps `crate::` reading the caller's own scope rather than
-    // turning into a verdict of "unresolved".
+    // `[lib] path` is the only source of truth for this crate root, just as a
+    // custom binary path is for the roots above.
     write("odd/Cargo.toml", '[package]\nname = "odd"\nedition = "2021"\n\n[lib]\npath = "core/root.rs"\n');
     write("odd/core/root.rs", `pub mod config;
 
@@ -324,19 +334,16 @@ pub fn go() -> u32 { crate::config::load() }
     ]);
   });
 
-  it("leaves a `src/bin` directory with no `main.rs` unresolved", async () => {
-    // `[[bin]] path = "src/bin/custom/helper.rs"` is the only thing that makes
-    // this file a target, and the manifest is not read here. The library and
-    // the `src/main.rs` binary both declare `helper`, and neither is it.
-    expect(await candidatesOf("tool/src/bin/custom/helper.rs", "helper", "crate")).toEqual([]);
+  it("uses a manifest-declared file as its own crate root", async () => {
+    expect(await candidatesOf("tool/src/bin/custom/helper.rs", "helper", "crate")).toEqual([
+      "tool/src/bin/custom/helper.rs::helper#3",
+    ]);
   });
 
-  it("does not read an unprovable target's `crate::` in its own scope", async () => {
-    // `crate::thing::run()` would find `custom/thing.rs` through the caller's
-    // own dependencies. Right answer, wrong reason: whether the crate root is
-    // `helper.rs` is exactly what cannot be established here, so the honest
-    // answer is none.
-    expect(await candidatesOf("tool/src/bin/custom/helper.rs", "run", "crate::thing")).toEqual([]);
+  it("walks modules from a manifest-declared crate root", async () => {
+    expect(await candidatesOf("tool/src/bin/custom/helper.rs", "run", "crate::thing")).toEqual([
+      "tool/src/bin/custom/thing.rs::run#1",
+    ]);
   });
 
   it("leaves a shared `tests/common/mod.rs` unresolved", async () => {
@@ -346,19 +353,19 @@ pub fn go() -> u32 { crate::config::load() }
     expect(await candidatesOf("tool/tests/common/mod.rs", "helper", "crate")).toEqual([]);
   });
 
-  it("leaves a `main.rs` no root reaches unresolved", async () => {
-    // `launcher/main.rs` is a `[[bin]] path` target outside every conventional
-    // directory. `mod x;` reads `x.rs` or `x/mod.rs` and never `x/main.rs`, so
-    // this is no module of the library either — answering with every root
-    // would name the library, which is a different crate.
-    expect(await candidatesOf("tool/launcher/main.rs", "helper", "crate")).toEqual([]);
+  it("uses a custom `main.rs` path as its own crate root", async () => {
+    expect(await candidatesOf("tool/launcher/main.rs", "helper", "crate")).toEqual([
+      "tool/launcher/main.rs::helper#1",
+    ]);
   });
 
-  it("keeps reading `crate::` in its own scope when a crate shows no root", async () => {
-    // Knowing nothing is not the same verdict as knowing the caller is out of
-    // reach: the empty answer above leaves an edge unresolved, and this one
-    // must not, or a crate laid out by `[lib] path` would lose every
-    // `crate::` edge it has.
+  it("does not send a custom single-file binary's `crate::` to the library", async () => {
+    expect(await candidatesOf("tool/launcher.rs", "helper", "crate")).toEqual([
+      "tool/launcher.rs::helper#1",
+    ]);
+  });
+
+  it("uses a manifest-declared library root outside conventional paths", async () => {
     expect(await candidatesOf("odd/core/root.rs")).toEqual(["odd/core/config.rs::load#1"]);
   });
 
@@ -415,6 +422,8 @@ describe("Rust multi-hop module paths", () => {
       graph.rustBindingsByFile,
       graph.rustCrateRootByFile,
       graph.rustInlineScopedCalls,
+      graph.rustInlineDeclaredSymbols,
+      graph.rustCrateRootsByFile,
     );
     const edge = (graph.outgoingCallsByFile.get(callerRel) ?? []).find(
       (e) => e.calleeName === name && e.calleeQualifier === qualifier,

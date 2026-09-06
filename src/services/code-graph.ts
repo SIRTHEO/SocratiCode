@@ -261,6 +261,7 @@ async function doRebuildGraph(
           built.rustCrateRootByFile,
           built.rustInlineScopedCalls,
           built.rustInlineDeclaredSymbols,
+          built.rustCrateRootsByFile,
         );
 
         progress.phase = "persisting symbols";
@@ -932,6 +933,8 @@ export async function buildCodeGraph(
   rustBindingsByFile: Map<string, RustUseBinding[]>;
   /** Rust file → its crate's directory prefix. Resolution input only. */
   rustCrateRootByFile: Map<string, string>;
+  /** Rust file → every target root its parsed Cargo manifest declares. */
+  rustCrateRootsByFile: Map<string, string[]>;
   /**
    * The call edges whose qualifier is rooted in an inline `mod` — a scope with
    * no file to name. Resolution leaves them unresolved. Held by identity, so
@@ -1113,13 +1116,21 @@ export async function buildCodeGraph(
   // the same rule the import resolver settled on. A crate at the root confines
   // nothing, which is correct: there is only one crate to be in.
   const rustCrateRootByFile = new Map<string, string>();
+  const rustCrateRootsByFile = new Map<string, string[]>();
   if (rustCrates && rustCrates.length > 0) {
     const depthOf = (crate: { dir: string }): number => (crate.dir === "." ? 0 : crate.dir.length);
     const ranked = [...rustCrates].sort((a, b) => depthOf(b) - depthOf(a));
     for (const relPath of files) {
       if (!relPath.endsWith(".rs")) continue;
       const owner = ranked.find((c) => c.dir === "." || relPath.startsWith(`${c.dir}/`));
-      if (owner) rustCrateRootByFile.set(relPath, owner.dir === "." ? "" : `${owner.dir}/`);
+      if (owner) {
+        rustCrateRootByFile.set(relPath, owner.dir === "." ? "" : `${owner.dir}/`);
+        // Only a parsed manifest is complete enough to make absence a verdict.
+        // An unreadable manifest contributes convention roots for import
+        // recovery, but those roots must not hide a custom target it could not
+        // declare to us.
+        if (!owner.manifestUnread) rustCrateRootsByFile.set(relPath, [...owner.roots]);
+      }
     }
   }
 
@@ -1380,6 +1391,7 @@ export async function buildCodeGraph(
     outgoingCallsByFile,
     rustBindingsByFile,
     rustCrateRootByFile,
+    rustCrateRootsByFile,
     rustInlineScopedCalls,
     rustInlineDeclaredSymbols,
   };

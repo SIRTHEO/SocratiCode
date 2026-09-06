@@ -70,7 +70,7 @@ export interface ExtractedSymbols {
    * beside the symbols and is never a field on one, so nothing about it is
    * persisted and a graph built before this still reads.
    */
-  inlineModSymbolIds?: Array<[id: string, outermostInlineMod: string]>;
+  inlineModSymbolIds?: Array<[id: string, inlineModPath: string]>;
 }
 
 /** Build a stable SymbolNode.id. */
@@ -1865,23 +1865,22 @@ function rustInlineModDepth(node: any): number {
 }
 
 /**
- * The name of the outermost inline `mod` around a node, or `null` when there
- * is none.
+ * The full path of inline `mod`s around a node, outermost first, or `null`
+ * when there is none.
  *
- * That is the one the file's own top level can name, and so the only one a
- * `use imp::*;` written there can read from: a `pub use imp::*;` carries what
- * `imp` exports and nothing from a sibling `mod altro { … }`, which rustc
- * refuses with E0425.
+ * The whole path matters to re-exports: `pub use imp::*;` carries direct
+ * exports from `imp`, but it does not flatten a private `imp::hidden` module
+ * into the file's top level.
  */
 // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
-function rustOutermostInlineMod(node: any): string | null {
-  let outermost: string | null = null;
+function rustInlineModPath(node: any): string | null {
+  const modules: string[] = [];
   for (let p = node.parent(); p; p = p.parent()) {
     if (p.kind() !== "mod_item") continue;
     const nameNode = p.field("name");
-    if (nameNode) outermost = nameNode.text();
+    if (nameNode) modules.unshift(nameNode.text());
   }
-  return outermost;
+  return modules.length > 0 ? modules.join("::") : null;
 }
 
 /**
@@ -1971,7 +1970,7 @@ function collectRustUseBindings(decl: any, bindings: RustUseBinding[]): void {
         const target = pathNode.text();
         bindings.push({
           local: aliasNode.text(),
-          path: target === "self" ? prefix : join(prefix, target),
+          path: target === "self" ? (prefix || "self") : join(prefix, target),
         });
         return;
       }
@@ -2055,7 +2054,7 @@ function extractFromRust(
       name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
     };
     declared.push({ sym, offset: r.start.index });
-    const fnInlineMod = rustOutermostInlineMod(fn);
+    const fnInlineMod = rustInlineModPath(fn);
     if (fnInlineMod) inlineModSymbolIds.push([sym.id, fnInlineMod]);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
@@ -2151,7 +2150,7 @@ function extractFromRust(
       },
       offset: r.start.index,
     });
-    const itemInlineMod = rustOutermostInlineMod(item);
+    const itemInlineMod = rustInlineModPath(item);
     if (itemInlineMod) inlineModSymbolIds.push([id, itemInlineMod]);
   }
 
