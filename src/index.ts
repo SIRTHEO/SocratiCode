@@ -43,7 +43,7 @@ import { writeSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { EXTENSION_LANGUAGE_MAP_INVALID, SOCRATICODE_VERSION } from "./constants.js";
+import { EXTENSION_LANGUAGE_MAP_INVALID, getWatcherMode, SOCRATICODE_VERSION } from "./constants.js";
 import { logger, setMcpLogSender } from "./services/logger.js";
 import {
   qdrantClientBreaksOnThisNode,
@@ -55,6 +55,10 @@ import { handleGraphTool } from "./tools/graph-tools.js";
 import { handleIndexTool } from "./tools/index-tools.js";
 import { handleManageTool } from "./tools/manage-tools.js";
 import { handleQueryTool } from "./tools/query-tools.js";
+
+// Validate lifecycle configuration before the server accepts any tools. An
+// invalid manual-mode value must never fall back to automatic index writes.
+getWatcherMode();
 
 const server = new McpServer(
   {
@@ -98,7 +102,7 @@ server.tool(
 
 server.tool(
   "codebase_update",
-  "Incrementally update an existing codebase index. Only re-indexes changed files. Runs synchronously. Usually not needed if file watcher is active.",
+  "Incrementally update an existing codebase index. Only re-indexes changed files. Runs synchronously. Use it to refresh a manual/off snapshot, or whenever an immediate catch-up is needed.",
   {
     projectPath: z
       .string()
@@ -141,7 +145,7 @@ server.tool(
 
 server.tool(
   "codebase_watch",
-  "Start/stop watching a project directory for file changes and automatically update the index. When starting, first runs an incremental update to catch any changes made since the last session, then keeps the index up to date via debounced file system watching.",
+  "Start/stop watching a project directory for file changes and automatically update the index. When starting, first runs an incremental update to catch up, then watches for changes. SOCRATICODE_WATCHER=manual allows explicit starts only; off rejects starts.",
   {
     projectPath: z
       .string()
