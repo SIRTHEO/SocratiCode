@@ -91,14 +91,28 @@ pub fn go_aliased() -> u32 { root::helper() }
       '[package]\nname = "alpha"\nedition = "2021"\n\n[dependencies]\nbeta = { path = "inner/beta" }\n',
     );
     write("crates/alpha/src/lib.rs", `pub mod config;
+pub mod sotto;
 use beta::config as bcfg;
 
 pub fn go() -> u32 {
     let _ = bcfg::load();
     crate::config::load()
 }
+
+pub fn out_of_the_crate() -> u32 {
+    crate::sotto::x::f()
+}
 `);
     write("crates/alpha/src/config.rs", "pub fn load() -> u32 { 3 }\n");
+    // A crate whose directory sits where a module of `alpha` would file its
+    // own children: `sotto.rs` belongs to `alpha`, and `sotto/` holds a crate
+    // of its own, so `sotto/x.rs` does not. A walk asks the file graph, which
+    // has the `mod x;` edge and no notion of a crate boundary, so `alpha`'s
+    // `crate::sotto::x` would otherwise land in another crate — which is what
+    // the confinement is there to stop, and what nothing exercised.
+    write("crates/alpha/src/sotto.rs", "pub mod x;\n");
+    write("crates/alpha/src/sotto/Cargo.toml", '[package]\nname = "sotto"\nedition = "2021"\n');
+    write("crates/alpha/src/sotto/x.rs", "pub fn f() -> u32 { 9 }\n");
     // ── One directory holding a library and a binary, which is two crates ──
     // `crate::` in `main.rs` is the binary's own root, and answering with the
     // library is a different file. Cargo gives `src/bin/x.rs` a crate too.
@@ -346,6 +360,14 @@ pub fn go() -> u32 { crate::config::load() }
     // must not, or a crate laid out by `[lib] path` would lose every
     // `crate::` edge it has.
     expect(await candidatesOf("odd/core/root.rs")).toEqual(["odd/core/config.rs::load#1"]);
+  });
+
+  it("stops a walk at the crate boundary, not only a suffix match", async () => {
+    // The file graph records `mod x;` and knows nothing of crates, so the walk
+    // reaches `sotto/x.rs` in two honest hops — and that file belongs to the
+    // crate whose `Cargo.toml` sits in `sotto/`, not to `alpha`. `crate::`
+    // means the caller's own crate, so the answer is nothing.
+    expect(await candidatesOf("crates/alpha/src/lib.rs", "f", "crate::sotto::x")).toEqual([]);
   });
 
   it("keeps a crate's `crate::` out of a crate nested inside its own directory", async () => {
