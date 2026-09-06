@@ -4,7 +4,7 @@
 /** Unit tests for query-tool routing and result formatting. */
 
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mocks ────────────────────────────────────────────────────────────────
 
@@ -80,10 +80,14 @@ vi.mock("../../src/services/context-artifacts.js", () => ({
 
 // ── watcher.js mock ──────────────────────────────────────────────────────
 
+const mockEnsureWatcherStarted = vi.fn();
+const mockIsWatching = vi.fn(() => false);
+const mockIsWatchedByAnyProcess = vi.fn(async () => false);
+
 vi.mock("../../src/services/watcher.js", () => ({
-  ensureWatcherStarted: vi.fn(),
-  isWatching: vi.fn(() => false),
-  isWatchedByAnyProcess: vi.fn(async () => false),
+  ensureWatcherStarted: (...args: unknown[]) => mockEnsureWatcherStarted(...args),
+  isWatching: (...args: unknown[]) => mockIsWatching(...args),
+  isWatchedByAnyProcess: (...args: unknown[]) => mockIsWatchedByAnyProcess(...args),
 }));
 
 // ── lock.js mock ─────────────────────────────────────────────────────────
@@ -106,6 +110,93 @@ import { handleQueryTool } from "../../src/tools/query-tools.js";
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const TEST_PATH = "/tmp/test-project";
+const SEARCH_RESULT: SearchResult = {
+  filePath: "/tmp/test-project/src/index.ts",
+  relativePath: "src/index.ts",
+  content: "export const value = 1;",
+  startLine: 1,
+  endLine: 1,
+  language: "typescript",
+  score: 0.5,
+};
+
+afterEach(() => {
+  delete process.env.SOCRATICODE_WATCHER;
+  mockIsWatching.mockReturnValue(false);
+  mockIsWatchedByAnyProcess.mockResolvedValue(false);
+});
+
+describe("manual indexing watcher status", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetCollectionInfo.mockResolvedValue({ pointsCount: 3, status: "green" });
+    mockGetProjectMetadata.mockResolvedValue(null);
+    mockLoadProjectEffectiveProfile.mockResolvedValue(null);
+  });
+
+  it("labels search results as a deliberate snapshot when watching is off", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+    mockSearchChunks.mockResolvedValueOnce([SEARCH_RESULT]);
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+    });
+
+    expect(output).toContain("INDEX SNAPSHOT");
+    expect(output).toContain("last explicit codebase_index or codebase_update");
+  });
+
+  it("does not tell agents to auto-start the watcher in manual mode", async () => {
+    process.env.SOCRATICODE_WATCHER = "manual";
+    mockSearchChunks.mockResolvedValueOnce([SEARCH_RESULT]);
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+    });
+
+    expect(output).toContain("SOCRATICODE_WATCHER=manual");
+    expect(output).toContain("Run codebase_update to refresh");
+    expect(output).not.toContain("being started automatically");
+  });
+
+  it("warns when another process can still update an off-mode shared index", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+    mockSearchChunks.mockResolvedValueOnce([SEARCH_RESULT]);
+    mockIsWatchedByAnyProcess.mockResolvedValueOnce(true);
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+    });
+
+    expect(output).toContain("another active watcher");
+    expect(output).toContain("for every MCP process");
+  });
+
+  it("reports off as disabled rather than inactive", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+
+    const output = await handleQueryTool("codebase_status", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(output).toContain("File watcher: disabled (SOCRATICODE_WATCHER=off)");
+    expect(output).not.toContain("File watcher: inactive");
+  });
+
+  it("reports manual mode with the explicit actions that can refresh it", async () => {
+    process.env.SOCRATICODE_WATCHER = "manual";
+
+    const output = await handleQueryTool("codebase_status", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(output).toContain("File watcher: inactive (SOCRATICODE_WATCHER=manual");
+    expect(output).toContain("codebase_update to refresh");
+  });
+});
 
 // ── includeLinked tests ──────────────────────────────────────────────────
 

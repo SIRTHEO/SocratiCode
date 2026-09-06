@@ -19,7 +19,7 @@ import { getLockHolderPid, releaseAllLocks } from "./lock.js";
 import { logger } from "./logger.js";
 import { getProjectMetadata, listCodebaseCollections } from "./qdrant.js";
 import { cleanStaleGenerations, coordinateProject, loadSymbolGraphMeta } from "./symbol-graph-store.js";
-import { isWatching, startWatching, stopAllWatchers } from "./watcher.js";
+import { isWatching, startWatchingAutomatically, stopAllWatchers } from "./watcher.js";
 
 /**
  * Auto-resume indexed projects on server startup.
@@ -29,9 +29,11 @@ import { isWatching, startWatching, stopAllWatchers } from "./watcher.js";
  * only the project at process.cwd() is considered.
  *
  *   - SOCRATICODE_AUTO_RESUME_PROJECTS: comma-separated list of project
- *     paths to resume. Takes precedence over SOCRATICODE_AUTO_RESUME.
+ *     paths to resume. Takes precedence over unset/all behavior.
  *   - SOCRATICODE_AUTO_RESUME=all: resume every indexed project that has a
  *     stored path in its Qdrant metadata.
+ *   - SOCRATICODE_AUTO_RESUME=off: skip all startup catch-up and interrupted
+ *     index recovery. This takes precedence over an explicit project list.
  *
  * Multi-project modes resume strictly sequentially: each project's catch-up
  * (incremental update or interrupted-index recovery) completes before the
@@ -53,6 +55,16 @@ import { isWatching, startWatching, stopAllWatchers } from "./watcher.js";
  */
 export async function autoResumeIndexedProjects(projectPath?: string): Promise<void> {
   try {
+    // Read at call time (not module load) so tests and MCP host configs that
+    // set variables after import are honoured. `off` is checked before any
+    // Docker or Qdrant access, and overrides the explicit project list: the
+    // promise is that startup performs no indexing work at all.
+    const resumeMode = process.env.SOCRATICODE_AUTO_RESUME?.trim();
+    if (resumeMode?.toLowerCase() === "off") {
+      logger.info("Auto-resume: disabled by SOCRATICODE_AUTO_RESUME=off");
+      return;
+    }
+
     // In managed mode, check if Docker and Qdrant are already running — don't start them.
     // In external mode, skip Docker checks and let listCodebaseCollections() fail if unreachable.
     if (QDRANT_MODE === "managed") {
@@ -66,10 +78,7 @@ export async function autoResumeIndexedProjects(projectPath?: string): Promise<v
       }
     }
 
-    // Read at call time (not module load) so tests and MCP host configs
-    // that set the variables after import are honoured.
     const explicitList = process.env.SOCRATICODE_AUTO_RESUME_PROJECTS?.trim();
-    const resumeMode = process.env.SOCRATICODE_AUTO_RESUME?.trim();
 
     if (explicitList) {
       await resumeProjectList(explicitList);
@@ -255,7 +264,7 @@ async function resumeProject(
       });
       // Now start the watcher after recovery — only if not cancelled
       if (!result.cancelled && !isWatching(resolvedPath)) {
-        const started = await startWatching(resolvedPath);
+        const started = await startWatchingAutomatically(resolvedPath);
         if (started) {
           logger.info("Auto-resume: started file watcher after recovery", { projectPath: resolvedPath });
         }
@@ -275,7 +284,7 @@ async function resumeProject(
   // is broken for search.
   if (!isWatching(resolvedPath)) {
     try {
-      const started = await startWatching(resolvedPath);
+      const started = await startWatchingAutomatically(resolvedPath);
       if (started) {
         logger.info("Auto-resume: started file watcher", { projectPath: resolvedPath });
       }

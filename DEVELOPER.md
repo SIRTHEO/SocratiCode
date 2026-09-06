@@ -249,6 +249,8 @@ All constants are defined in `src/constants.ts`:
 | `OLLAMA_CONTAINER_NAME` | `socraticode-ollama` | Docker container name |
 | `OLLAMA_IMAGE` | `ollama/ollama:latest` | Docker image |
 
+`getWatcherMode()` resolves `SOCRATICODE_WATCHER=auto|manual|off` at call time and rejects unknown values. `src/index.ts` invokes it during startup so invalid lifecycle configuration fails before tools are accepted.
+
 > **Note**: `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, and `EMBEDDING_CONTEXT_LENGTH` are defined in `src/services/embedding-config.ts`, not in `src/constants.ts`. Defaults are `nomic-embed-text` / `768` for Ollama, `text-embedding-3-small` / `1536` for OpenAI, and `gemini-embedding-001` / `3072` for Google.
 
 ### Embedding batch size
@@ -827,17 +829,22 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 | `updateProjectIndex` | `(projectPath, onProgress?, extraExtensions?) → Promise<{ added, updated, removed, chunksCreated, cancelled }>` | Incremental update |
 | `removeProjectIndex` | `(projectPath) → Promise<void>` | Delete index, code graph, and context artifacts |
 
+### startup.ts
+
+`autoResumeIndexedProjects()` checks `SOCRATICODE_AUTO_RESUME=off` before Docker, Qdrant, explicit project lists, or any persisted-index access. Otherwise it preserves the existing current-project, explicit-list, and `all` modes. Watcher starts from startup pass through `startWatchingAutomatically`, so `manual` and `off` suppress the watcher without suppressing the catch-up update; combine watcher `off` with auto-resume `off` for a fully deliberate code-index snapshot.
+
 ### watcher.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `startWatching` | `(projectPath, onProgress?) → Promise<boolean>` | Start @parcel/watcher native subscription. Returns `true` if now watching (or already was), `false` if another process holds the lock or subscription failed |
+| `startWatching` | `(projectPath, onProgress?) → Promise<boolean>` | Start @parcel/watcher native subscription. Permitted in `auto` and `manual`, rejected before lock acquisition in `off`. Returns `true` if now watching (or already was), `false` if disabled, another process holds the lock, or subscription failed |
+| `startWatchingAutomatically` | `(projectPath, onProgress?) → Promise<boolean>` | Start only in `SOCRATICODE_WATCHER=auto`; shared guard for startup and post-index/update paths |
 | `stopWatching` | `(projectPath) → Promise<void>` | Stop watcher |
 | `stopAllWatchers` | `() → Promise<void>` | Stop all watchers |
 | `isWatching` | `(projectPath) → boolean` | Check if a project is being watched **by this process** |
 | `isWatchedByAnyProcess` | `(projectPath) → Promise<boolean>` | Cross-process check: local subscriptions first, then file-based lock |
 | `getWatchedProjects` | `() → string[]` | List watched paths |
-| `ensureWatcherStarted` | `(projectPath) → void` | Fire-and-forget auto-start with TTL cache: checks not watching, not externally watched (60s cache), not indexing, collection exists |
+| `ensureWatcherStarted` | `(projectPath) → void` | Fire-and-forget auto-start in `auto` mode with TTL cache: checks not watching, not externally watched (60s cache), not indexing, collection exists. Returns before storage access in `manual`/`off` |
 | `clearExternalWatchCache` | `() → void` | Clear the external watch TTL cache (for testing) |
 
 Watcher settings:
@@ -847,13 +854,16 @@ Watcher settings:
 - Auto-stops after 10 consecutive errors
 - Cross-process lock prevents duplicate watchers
 - Cross-process status awareness: `codebase_status` and `codebase_search` detect watchers running in other MCP processes via file-based locks
-- Auto-starts on first tool interaction with an indexed project (search, status, update, graph), with 60-second TTL cache to avoid retrying when another process holds the lock
+- Auto-starts on first tool interaction with an indexed project (search, status, update, graph) only in `auto`, with 60-second TTL cache to avoid retrying when another process holds the lock
+- `manual` disables every automatic watcher start but leaves explicit `codebase_watch start` available; `off` rejects explicit starts too
+- Watcher mode is process-local. Every MCP process sharing a checkout must use the same snapshot setting; status warns when an `off` process detects another watcher
 
 ### code-graph.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `buildCodeGraph` | `(projectPath, extraExtensions?, progress?) → Promise<CodeGraph>` | Build dependency graph via ast-grep with optional progress tracking |
+| `getExistingGraph` | `(projectPath) → Promise<CodeGraph \| null>` | Load a cached or persisted graph without creating one |
 | `getOrBuildGraph` | `(projectPath, extraExtensions?) → Promise<CodeGraph>` | Get cached graph or build new one |
 | `rebuildGraph` | `(projectPath, extraExtensions?) → Promise<CodeGraph>` | Force rebuild with concurrency guard (joins existing build if in progress) |
 | `invalidateGraphCache` | `(projectPath) → void` | Clear cached graph for project |
@@ -1140,6 +1150,8 @@ Parameters:
 
 Returns: Status message or list of watched projects
 ```
+
+`SOCRATICODE_WATCHER=manual` suppresses automatic starts but permits the `start` action. `off` rejects `start` before infrastructure or catch-up work and reports the watcher as disabled. `stop` remains available in all modes. Use `SOCRATICODE_AUTO_RESUME=off` as well when startup must not run an incremental catch-up or resume interrupted indexing.
 
 ### Query Tools
 

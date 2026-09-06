@@ -143,26 +143,30 @@ export async function getOrBuildGraph(
   projectPath: string,
   extraExtensions?: Set<string>,
 ): Promise<CodeGraph> {
+  const existing = await getExistingGraph(projectPath);
+  if (existing) return existing;
+
   const resolved = path.resolve(projectPath);
-  const cached = graphCache.get(resolved);
-  if (cached) {
-    return cached;
-  }
-
-  // Try loading persisted graph from Qdrant
-  const projectId = projectIdFromPath(resolved);
-  const graphCollName = graphCollectionName(projectId);
-  const persisted = await loadGraphData(graphCollName);
-  if (persisted) {
-    graphCache.set(resolved, persisted);
-    return persisted;
-  }
-
   const graph = await buildCodeGraph(resolved, extraExtensions);
   // Strip symbol fields when serving as a plain CodeGraph
   const plain: CodeGraph = { nodes: graph.nodes, edges: graph.edges };
   graphCache.set(resolved, plain);
   return plain;
+}
+
+/** Get a cached or persisted graph without creating one when it is absent. */
+export async function getExistingGraph(projectPath: string): Promise<CodeGraph | null> {
+  const resolved = path.resolve(projectPath);
+  const cached = graphCache.get(resolved);
+  if (cached) return cached;
+
+  const projectId = projectIdFromPath(resolved);
+  const graphCollName = graphCollectionName(projectId);
+  const persisted = await loadGraphData(graphCollName);
+  if (!persisted) return null;
+
+  graphCache.set(resolved, persisted);
+  return persisted;
 }
 
 /** Options for `rebuildGraph` controlling which layers are rebuilt. */

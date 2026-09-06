@@ -8,6 +8,29 @@ const esmRequire = createRequire(import.meta.url);
 const pkg = esmRequire("../package.json") as { version: string };
 export const SOCRATICODE_VERSION: string = pkg.version;
 
+// ── Indexing lifecycle configuration ───────────────────────────────────
+
+/** File-watcher policy for this MCP process. */
+export type WatcherMode = "auto" | "manual" | "off";
+
+/**
+ * Resolve SOCRATICODE_WATCHER at call time.
+ *
+ * Reading lazily keeps test and embedded-host configuration predictable while
+ * the startup entry point still validates the value before accepting tools.
+ * Unknown values fail loudly: silently restoring automatic writes would break
+ * the user's deliberate snapshot guarantee.
+ */
+export function getWatcherMode(): WatcherMode {
+  const raw = process.env.SOCRATICODE_WATCHER?.trim().toLowerCase() ?? "";
+  if (raw === "" || raw === "auto") return "auto";
+  if (raw === "manual" || raw === "off") return raw;
+  throw new Error(
+    `Invalid SOCRATICODE_WATCHER: "${process.env.SOCRATICODE_WATCHER}". ` +
+    'Must be "auto", "manual", or "off".',
+  );
+}
+
 // ── Embedding configuration ──────────────────────────────────────────────
 // Embedding model and dimensions are now configured via environment variables.
 // See src/services/embedding-config.ts for OLLAMA_MODE, OLLAMA_URL,
