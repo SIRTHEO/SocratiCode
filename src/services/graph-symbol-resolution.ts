@@ -116,6 +116,14 @@ function matchModulePath(deps: string[], segments: string[]): string[] {
  * "src/bin/helper.rs"`, not `src/bin/x/helper.rs`, and a `tests/t.rs` with
  * `mod support;` compiles against `tests/support.rs`. So `isCrateRoot` is
  * asked, and not guessed from the name.
+ *
+ * The three stems are still read by name, and that is Rust's module rule
+ * rather than a second guess at rootness: `src/a/mod.rs` is no crate root and
+ * files its children in `src/a/` all the same. It is wrong in exactly one
+ * shape — a `main.rs` that is an ordinary module, declared by a `mod main;`
+ * somewhere, whose children Rust would file under `main/`. Not reproduced
+ * against cargo, and named here rather than left implied by a comment that
+ * claims the question has only one answer in this file.
  */
 function childModuleDirOf(file: string, isCrateRoot: boolean): string {
   const noExt = stripKnownExt(file);
