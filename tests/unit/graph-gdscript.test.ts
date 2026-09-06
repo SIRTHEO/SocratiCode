@@ -1979,6 +1979,13 @@ func setup():
       expect(specs).toContain("res://scripts/Player.gd");
     });
 
+    it("keeps escaped matching quotes inside raw strings", () => {
+      const source = 'var text = r"quote: \\" still raw"; var real = preload("res://real.gd")';
+      const specs = extractGdscriptImportsRegex(source).map((item) => item.moduleSpecifier);
+
+      expect(specs).toEqual(["res://real.gd"]);
+    });
+
     it("does not extract preload from comments", () => {
       const source = [
         '# preload("res://comment.gd")',

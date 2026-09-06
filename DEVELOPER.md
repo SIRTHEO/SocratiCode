@@ -1032,7 +1032,7 @@ Supports 19+ languages including TypeScript, JavaScript, Python, Java, Kotlin, G
 | `pythonRootsForFile` | `(manifests, relSourceDir) → string[]` | Python: the import roots that apply to one file, ancestry- and membership-scoped, nearest first |
 | `buildElixirModuleMap` | `(fileSet, projectPath) → Map<string, string[]>` | Elixir: `defmodule` name → declaring files (AST-derived), resolving `alias`/`import`/`require`/`use` |
 | `hasLiteralShellPathShape` | `(specifier) → boolean` | Shell: whether a `source` argument is a literal path worth resolving |
-| `buildClassNameIndex` | `(projectPath, fileSet) → ClassNameIndex` | GDScript: class_name → file path index for O(1) extends resolution |
+| `buildClassNameIndex` | `(projectPath, fileSet) → ClassNameIndex` | GDScript: legacy global class_name index retained for compatibility; use `buildGodotProjectIndexes` for project-scoped resolution |
 | `buildGodotProjectIndexes` | `(projectPath, fileSet, rootCache?) → GodotProjectIndexes` | GDScript: per-project class_name indexes, keyed by Godot project root |
 | `buildGodotUidIndexes` | `(projectPath, fileSet, rootCache?) → GodotProjectUidIndexes` | GDScript: per-project uid:// → relative path index, from .uid sidecars and .tscn/.tres headers |
 | `findGodotProjectRootForProject` | `(projectPath) → string \| null` | GDScript: find Godot project root (directory containing project.godot) |

@@ -2249,16 +2249,19 @@ export function resolveRustImport(
 
 /**
  * Pre-built index mapping GDScript class_name declarations to their file paths.
- * Built once by buildClassNameIndex() during graph construction to avoid
- * repeated file reads during import resolution.
+ * Normal graph construction builds one scoped index per Godot project with
+ * buildGodotProjectIndexes() to avoid repeated file reads and cross-project
+ * name leakage.
  */
 export type ClassNameIndex = Map<string, string>;
 
 /**
  * Scan all .gd files in a fileSet for `class_name X` declarations and build
- * a Map<className, relativePath>. Called once per graph build so that
- * resolveImport can do O(1) class-name lookups instead of re-reading every
- * .gd file for each extends statement.
+ * a global Map<className, relativePath>.
+ *
+ * @deprecated Legacy helper retained for compatibility. New graph-building
+ * code should use buildGodotProjectIndexes() so class names remain scoped to
+ * their nearest Godot project.
  */
 export function buildClassNameIndex(
   projectPath: string,

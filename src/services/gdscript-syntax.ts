@@ -49,7 +49,10 @@ export function tokenizeGdscript(source: string): GdscriptToken[] {
       index = quoteIndex + delimiterLength;
 
       while (index < source.length) {
-        if (!rawPrefix && source[index] === "\\") {
+        // Raw strings still recognize an escaped matching quote (and `\\\\`).
+        // Skip the escaped code point before checking for the closing delimiter
+        // so `r"quoted: \\" text"` remains one string token.
+        if (source[index] === "\\") {
           index += Math.min(2, source.length - index);
           continue;
         }
