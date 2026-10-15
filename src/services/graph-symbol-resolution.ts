@@ -1056,9 +1056,9 @@ export function resolveCallSites(
      * `super::queue` through one), and a crate root named by `[[bin]] path =`
      * rather than by its location.
      *
-     * Measured over ripgrep 14.1.1, tokio 1.40.0 and Sailor: 46 edges that
+     * Measured over ripgrep 14.1.1 and tokio 1.40.0: 46 edges that
      * resolve today are ones the walk alone does not reach — 28 in tokio, 18 in
-     * ripgrep, none in Sailor. The fallback recovers 40 of them, and all 40
+     * ripgrep. The fallback recovers 40 of them, and all 40
      * were read against the Rust source and were right. Refusing them buys no
      * truth: the walk has nothing to say there, so the choice is the old answer
      * or none. The 6 it does not recover are the ones where the walk does reach

@@ -1448,8 +1448,8 @@ function extractCargoAliases(
  * tree, whose root is a target's root module — `src/lib.rs`, `src/main.rs`, or
  * whatever `[[bin]] path` declares. `some_crate::` names a whole other crate,
  * which is only in this project if a manifest here declares it, under a name
- * whose dashes Cargo turns into underscores (`sailor-core` is imported as
- * `sailor_core`). None of the three resolved before this map existed: every
+ * whose dashes Cargo turns into underscores (`my-core` is imported as
+ * `my_core`). None of the three resolved before this map existed: every
  * specifier containing `::` returned null, so a Rust project's file graph came
  * out as its bare `mod` declarations and nothing else.
  *
